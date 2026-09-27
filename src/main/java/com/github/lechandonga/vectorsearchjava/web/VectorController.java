@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -115,6 +116,50 @@ class VectorController {
     ApiDtos.RebuildResponse rebuild() {
         RebuildResult r = service.rebuild();
         return new ApiDtos.RebuildResponse(r.fromVersion(), r.toVersion(), r.objectCount());
+    }
+
+    // ------------------------------------------------------------ 可续跑导出
+
+    /** 发起导出：返回导出标识、续跑凭据与会话信息。 */
+    @PostMapping("/exports")
+    Map<String, Object> startExport(@RequestBody(required = false) ApiDtos.StartExportRequest req) {
+        Integer pageSize = req == null ? null : req.pageSize();
+        return ExportResponses.toStartBody(service.startExport(pageSize));
+    }
+
+    /** 凭凭据取一页（凭据通过 X-Export-Token 头传递；页大小在发起时已固定）。 */
+    @PostMapping("/exports/{id}/pages")
+    Map<String, Object> exportPage(@PathVariable("id") String id,
+                                   @RequestHeader(value = "X-Export-Token", required = false)
+                                   String token,
+                                   @RequestBody(required = false) ApiDtos.ExportPageRequest req) {
+        int page = req == null || req.page() == null ? 1 : req.page();
+        if (req != null && req.pageSize() != null) {
+            // 会话页大小在发起时固定，取页请求不允许改变，避免分页口径漂移
+            throw new ApiException(ErrorCode.INVALID_PAGINATION,
+                    "pageSize is fixed at export creation and cannot be changed per page");
+        }
+        return ExportResponses.toPageBody(service.fetchExportPage(id, token, page));
+    }
+
+    /** 查询导出会话状态。 */
+    @GetMapping("/exports/{id}")
+    Map<String, Object> describeExport(@PathVariable("id") String id) {
+        return ExportResponses.toInfoBody(service.describeExport(id));
+    }
+
+    /** 主动取消导出会话。 */
+    @PostMapping("/exports/{id}/cancel")
+    Map<String, Object> cancelExport(@PathVariable("id") String id,
+                                     @RequestHeader(value = "X-Export-Token", required = false)
+                                     String token) {
+        return ExportResponses.toInfoBody(service.cancelExport(id, token));
+    }
+
+    /** 导出子系统观测指标。 */
+    @GetMapping("/admin/export-stats")
+    Object exportStats() {
+        return service.exportStats();
     }
 
     @GetMapping("/admin/stats")

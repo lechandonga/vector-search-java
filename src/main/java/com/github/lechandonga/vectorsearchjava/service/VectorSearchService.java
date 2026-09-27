@@ -4,6 +4,8 @@ import com.github.lechandonga.vectorsearchjava.config.VectorSearchProperties;
 import com.github.lechandonga.vectorsearchjava.embedding.TextEmbedder;
 import com.github.lechandonga.vectorsearchjava.error.ApiException;
 import com.github.lechandonga.vectorsearchjava.error.ErrorCode;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionManager;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionInfo;
 import com.github.lechandonga.vectorsearchjava.index.SearchFilter;
 import com.github.lechandonga.vectorsearchjava.index.SearchResult;
 import com.github.lechandonga.vectorsearchjava.index.VectorIndex;
@@ -23,6 +25,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -48,6 +53,8 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
     private final VectorSearchProperties props;
     private final DurableStore store;
     private final TextEmbedder embedder;
+    /** 可续跑导出会话管理器（独立持久化，跨重启恢复）。 */
+    private final ExportSessionManager exportSessions;
     /** 当前已发布的最新不可变版本节点；原子切换，进行中的查询可继续持有旧节点。 */
     private final AtomicReference<VectorIndex> current = new AtomicReference<>();
     /** 最近版本节点，按版本号倒序保留，供跨分页查询固定快照；与 current 同锁维护。 */
@@ -58,6 +65,8 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
     private final ReentrantReadWriteLock mutationRwLock = new ReentrantReadWriteLock();
     /** 重建互斥：避免多个重建并发进行。 */
     private final Object rebuildLock = new Object();
+    /** 导出会话过期扫描的后台调度器。 */
+    private ScheduledExecutorService exportSweeper;
 
     private long totalWrites;
     private long totalDeletes;
@@ -77,11 +86,37 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
         this.embedder = new TextEmbedder(props.getDimension());
         this.retainedVersions = Math.max(2, props.getRetainedVersions());
         publishSnapshotIndex(store.snapshot());
+        this.exportSessions = new ExportSessionManager(props, java.time.Clock.systemUTC());
+        startExportSweeper();
         log.info("VectorSearchService started. dimension={} maxObjects={} maxQueryCandidates={} "
                         + "policy={} wal={} recoveredVersion={} recoveredObjects={}",
                 props.getDimension(), props.getMaxObjects(), props.getMaxQueryCandidates(),
                 props.getQueryLimitPolicy(), props.getDataDir(),
                 current.get().version(), current.get().size());
+    }
+
+    /**
+     * 后台守护线程：按 {@code vector-search.export.sweep-interval-ms} 周期失效超时导出会话。
+     * 扫描不持主服务锁，只走导出管理器内部锁，不影响写入/检索。
+     */
+    private void startExportSweeper() {
+        long intervalMs = Math.max(1_000L, props.getExport().getSweepIntervalMs());
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "export-session-sweeper");
+            t.setDaemon(true);
+            return t;
+        });
+        this.exportSweeper = scheduler;
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                int n = exportSessions.sweepExpired();
+                if (n > 0) {
+                    log.info("export sweeper expired {} session(s)", n);
+                }
+            } catch (Throwable t) {
+                log.warn("export sweeper iteration failed: {}", t.getMessage());
+            }
+        }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     }
 
     // ------------------------------------------------------------------ 写入
@@ -443,6 +478,43 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
         }
     }
 
+    // ------------------------------------------------------------------ 导出会话
+
+    /**
+     * 发起可续跑导出：原子抓取当前最新不可变版本节点，将其固定视图持久化为导出快照，
+     * 返回续跑凭据与本次导出标识。抓取后发生的写入/删除/重建不影响本次导出。
+     */
+    public ExportSessionManager.CreatedExport startExport(Integer requestedPageSize) {
+        VectorIndex snapshot = current.get();
+        List<VectorRecord> records = snapshot.liveRecordsOrdered();
+        return exportSessions.create(records, snapshot.version(), requestedPageSize);
+    }
+
+    /** 凭续跑凭据取一页导出数据（page 为 1 基页号；页大小在发起时固定）。 */
+    public ExportSessionManager.ExportPage fetchExportPage(String exportId, String token, int page) {
+        return exportSessions.fetch(exportId, token, page);
+    }
+
+    /** 主动取消导出会话。 */
+    public ExportSessionInfo cancelExport(String exportId, String token) {
+        return exportSessions.cancel(exportId, token);
+    }
+
+    /** 查询导出会话状态。 */
+    public ExportSessionInfo describeExport(String exportId) {
+        return exportSessions.describe(exportId);
+    }
+
+    /** 扫描并失效超过保留期的导出会话。 */
+    public int sweepExpiredExports() {
+        return exportSessions.sweepExpired();
+    }
+
+    /** 导出子系统观测指标。 */
+    public ExportSessionManager.ExportStats exportStats() {
+        return exportSessions.stats();
+    }
+
     // ------------------------------------------------------------------ 观测
 
     public ServiceStats stats() {
@@ -453,7 +525,14 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
 
     @Override
     public void destroy() throws Exception {
-        store.close();
+        if (exportSweeper != null) {
+            exportSweeper.shutdownNow();
+        }
+        try {
+            exportSessions.close();
+        } finally {
+            store.close();
+        }
     }
 
     @Override

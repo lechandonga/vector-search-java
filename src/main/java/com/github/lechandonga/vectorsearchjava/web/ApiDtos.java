@@ -61,6 +61,14 @@ public final class ApiDtos {
     public record RebuildResponse(long fromVersion, long toVersion, int objectCount) {
     }
 
+    /** POST /exports 请求体（全部字段可选）。 */
+    public record StartExportRequest(Integer pageSize) {
+    }
+
+    /** POST /exports/{id}/pages 请求体（page 必填，pageSize 可选）。 */
+    public record ExportPageRequest(Integer page, Integer pageSize) {
+    }
+
     /** 错误响应体：错误码可区分失败原因。 */
     public record ErrorResponse(String error, String message, String code) {
     }

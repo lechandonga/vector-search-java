@@ -133,7 +133,22 @@ final class WalCodec {
         return crc.getValue();
     }
 
-    private static String escape(String s) {
+    /** 对 TAB 分隔字段数组计算 CRC32（供同包的其它行式日志复用）。 */
+    static long crc32(String[] fields) {
+        return crc(fields);
+    }
+
+    /** 文本字段转义（TAB/换行/反斜杠），供同包的其它行式日志复用。 */
+    static String esc(String s) {
+        return escape(s);
+    }
+
+    /** 文本字段去转义；非法转义抛 {@link WalCorruptionException}。 */
+    static String unesc(String s) throws WalCorruptionException {
+        return unescape(s);
+    }
+
+    static String escape(String s) {
         if (s == null || s.isEmpty()) {
             return "";
         }

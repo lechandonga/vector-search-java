@@ -151,6 +151,23 @@ public final class VectorIndex {
     }
 
     /**
+     * 枚举本版本固定视图中的全部存活记录，按确定性顺序（sequence 升序，sequence 相同按
+     * id 字典序）返回。用于可续跑导出：结果在视图绑定后不再受后续写入/删除/重建影响。
+     */
+    public List<VectorRecord> liveRecordsOrdered() {
+        Map<String, VectorRecord> byId = resolveLive();
+        List<VectorRecord> live = new ArrayList<>(byId.size());
+        for (VectorRecord r : byId.values()) {
+            if (r != null) {
+                live.add(r);
+            }
+        }
+        live.sort(Comparator.comparingLong(VectorRecord::sequence)
+                .thenComparing(VectorRecord::id));
+        return live;
+    }
+
+    /**
      * 在固定版本上检索。
      *
      * @param scanLimit 参与打分的最大候选数；{@code <=0} 表示不限

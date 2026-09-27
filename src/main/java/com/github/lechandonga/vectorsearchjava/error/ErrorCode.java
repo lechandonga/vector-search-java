@@ -26,6 +26,24 @@ public enum ErrorCode {
     PERSISTENCE_FAILURE(HttpStatus.INTERNAL_SERVER_ERROR),
     /** 重建索引过程中失败。 */
     REBUILD_FAILED(HttpStatus.INTERNAL_SERVER_ERROR),
+    /** 导出会话不存在（或已被清理）。 */
+    EXPORT_NOT_FOUND(HttpStatus.NOT_FOUND),
+    /** 导出凭据无效/不匹配。 */
+    EXPORT_UNAUTHORIZED(HttpStatus.UNAUTHORIZED),
+    /** 导出会话已被客户端主动取消。 */
+    EXPORT_CANCELLED(HttpStatus.GONE),
+    /** 导出会话已超过保留期失效。 */
+    EXPORT_EXPIRED(HttpStatus.GONE),
+    /** 请求页与已确认进度不连续（跳页）。 */
+    EXPORT_PAGE_GAP(HttpStatus.CONFLICT),
+    /** 同时存在的活跃导出会话数达到上限。 */
+    EXPORT_SESSION_LIMIT(HttpStatus.TOO_MANY_REQUESTS),
+    /** 单次导出绑定的数据量超过记录数上限。 */
+    EXPORT_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE),
+    /** 导出快照落盘后超出会话/总存储字节上限。 */
+    EXPORT_STORAGE_LIMIT(HttpStatus.PAYLOAD_TOO_LARGE),
+    /** 会话仍在但不可变快照数据文件缺失或损坏（存储故障，区别于过期）。 */
+    EXPORT_DATA_MISSING(HttpStatus.INTERNAL_SERVER_ERROR),
     /** 不支持的操作。 */
     UNSUPPORTED(HttpStatus.BAD_REQUEST);
 
