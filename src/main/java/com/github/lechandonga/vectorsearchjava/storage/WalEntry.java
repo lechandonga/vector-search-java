@@ -23,7 +23,9 @@ public final class WalEntry {
         PUT,
         DELETE,
         STARTTX,
-        COMMIT
+        COMMIT,
+        /** 压缩快照下界标记：其 seq 即压缩后仍可物化的最老版本，早于它的历史已折叠。 */
+        BASE
     }
 
     private final long seq;

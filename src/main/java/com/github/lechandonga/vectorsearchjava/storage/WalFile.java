@@ -68,7 +68,7 @@ public class WalFile implements AutoCloseable {
         List<WalEntry> entries = new ArrayList<>();
         boolean truncated = false;
         String reason = null;
-        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        List<String> lines = readRawLines();
         for (String line : lines) {
             if (line.isEmpty()) {
                 continue;
@@ -84,6 +84,19 @@ public class WalFile implements AutoCloseable {
             }
         }
         return new ReplayResult(entries, truncated, reason);
+    }
+
+    /**
+     * 读取全部原始行（不做校验/解析）。并发追加期间调用时，末尾可能出现撕裂行——
+     * 调用方按 {@link WalCodec#decode} 自行截断尾部即可；空行跳过。
+     */
+    public List<String> readRawLines() throws IOException {
+        List<String> lines;
+        synchronized (writeLock) {
+            // 与压缩替换互斥：替换期间直接读可能撞到文件移动窗口
+            lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        }
+        return lines;
     }
 
     /**

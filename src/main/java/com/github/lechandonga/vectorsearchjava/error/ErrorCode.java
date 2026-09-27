@@ -26,6 +26,18 @@ public enum ErrorCode {
     PERSISTENCE_FAILURE(HttpStatus.INTERNAL_SERVER_ERROR),
     /** 重建索引过程中失败。 */
     REBUILD_FAILED(HttpStatus.INTERNAL_SERVER_ERROR),
+    /** 并发导出会话数或单会话占用达到上限。 */
+    EXPORT_LIMIT_REACHED(HttpStatus.TOO_MANY_REQUESTS),
+    /** 导出凭据不存在（id 未知或凭据不匹配）。 */
+    EXPORT_NOT_FOUND(HttpStatus.NOT_FOUND),
+    /** 导出会话已超时失效。 */
+    EXPORT_EXPIRED(HttpStatus.GONE),
+    /** 导出会话已被主动取消。 */
+    EXPORT_CANCELLED(HttpStatus.GONE),
+    /** 导出会话已正常结束。 */
+    EXPORT_FINISHED(HttpStatus.GONE),
+    /** 导出绑定的数据视图已无法物化（超出保留期/压缩后历史不可得）。 */
+    EXPORT_SNAPSHOT_UNAVAILABLE(HttpStatus.GONE),
     /** 不支持的操作。 */
     UNSUPPORTED(HttpStatus.BAD_REQUEST);
 

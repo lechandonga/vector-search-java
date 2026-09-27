@@ -7,6 +7,8 @@
 - 文本向量由内置的**确定性**算法在本地生成，给定文本永远得到同一向量
 - 多版本不可变索引（MVCC 风格版本链）提供查询快照隔离
 - 写入先持久化（fsync）后可见，支持崩溃恢复；删除以墓碑长期保留
+- **可续跑导出会话**：绑定发起时数据视图，凭据可跨重启续跑，逐页不重不漏、
+  顺序稳定可复现；并发写入/删除/重建不污染导出，WAL 压缩按活跃导出保留下界
 - 可配置资源上限与 REJECT / DEGRADE 策略，降级结果可区分且有日志记录
 
 ---
@@ -126,6 +128,32 @@ curl -X POST localhost:8080/admin/rebuild   # 原子切换；失败自动回退
 curl localhost:8080/admin/stats             # 版本、存活对象数、拒绝/降级计数
 ```
 
+### 可续跑导出（跨重启、分批复用）
+
+适合长时间数据导出、跨系统对账：一次发起、长期续跑，整次导出固定在发起那一刻的数据视图上。
+
+```bash
+# 1) 发起：拿到 exportId 与长期续跑凭据 credential（只在响应中出现一次）
+curl -X POST localhost:8080/exports -H 'Content-Type: application/json' -d '{
+  "filter": {"category": "zoo"},   // 可选，语义与检索过滤一致（等值 AND）
+  "pageSize": 500                  // 可选，缺省用 vector-search.export-default-page-size
+}'
+# -> {"exportId":"exp_...","credential":"...","snapshotVersion":17,
+#     "state":"ACTIVE","totalRecords":1234,"totalPages":3, ...}
+
+# 2) 一页一页拉（页号从 1 开始；凭据放在 X-Export-Credential 头）
+curl localhost:8080/exports/exp_xxx/pages/1 -H 'X-Export-Credential: <credential>'
+# -> {"page":1,"pageSize":500,"totalRecords":1234,"finished":false,
+#     "records":[{"id":"...","vector":[...],"source":"TEXT","text":...,"metadata":{...},"sequence":12}], ...}
+
+# 3) 状态/进度、主动取消、正常结束
+curl localhost:8080/exports/exp_xxx                -H 'X-Export-Credential: <credential>'
+curl -X POST localhost:8080/exports/exp_xxx/cancel  -H 'X-Export-Credential: <credential>'
+curl -X POST localhost:8080/exports/exp_xxx/complete -H 'X-Export-Credential: <credential>'
+```
+
+导出语义见第 4.1 节，生命周期/容量配置见第 5 节。
+
 ---
 
 ## 4. 快照隔离与删除语义
@@ -147,6 +175,50 @@ curl localhost:8080/admin/stats             # 版本、存活对象数、拒绝/
 
 ---
 
+## 4.1 可续跑导出的语义
+
+可续跑导出是在 4.1 之前的快照隔离之上，再加一层**持久化、跨重启的会话**：
+
+- **绑定发起时视图**：发起导出时抓取当时的最新版本号 `snapshotVersion`。整次导出
+  （含过滤条件、页大小、总记录数、每一页）都固定在该版本视图上——发起之后的新写入
+  不会出现在结果里，发起之后的删除/重建也不影响这次导出已确定的内容。
+- **顺序稳定、不重不漏**：导出页按 **id 字典序**切分，页大小在发起时固定。
+  逐页拼起来等于该视图（过滤后）全集；同一凭据重复拉同一页得到**逐字节一致**的结果，
+  页可乱序/重试拉取。最后一页响应 `finished=true`。
+- **跨重启续跑**：会话元数据与每次已确认拉页的进度写入数据目录下独立的
+  `export-sessions.log`（每条事件 `fsync`）；绑定的历史视图通过**重放数据 WAL 到该版本**
+  重建，而不是依赖只在进程内短期有效的内存版本链。因此进程重启后凭**同一 exportId +
+  凭据**可从任意页继续，结果与没重启过完全一致，不跳页、不重页、不返回半截页。
+  - 凭据是 256 位随机串（只在发起响应中明文出现一次）；持久化日志里只存其
+    SHA-256 哈希，凭据错误/会话不存在返回 `EXPORT_NOT_FOUND`，无法与其它失败混淆。
+  - “已确认的拉页进度”以服务端 `fsync` 成功为准；重复拉页是幂等的，客户端重试安全。
+- **续不了时给可区分原因，绝不静默返回错数据**：
+  - `EXPORT_EXPIRED`（410）：空闲超时或绝对寿命到期；
+  - `EXPORT_CANCELLED`（410）：已被主动取消；
+  - `EXPORT_FINISHED`（410）：已正常结束；
+  - `EXPORT_SNAPSHOT_UNAVAILABLE`（410）：绑定视图历史已超出保留期被压缩清除；
+  - `EXPORT_NOT_FOUND`（404）：id 未知或凭据不匹配；
+  - `EXPORT_LIMIT_REACHED`（429）：并发会话数或单会话占用到顶。
+- **导出不阻塞写入，也不被并发变更污染**：导出读历史 WAL 走独立路径，不持变更锁；
+  并发的写入/删除/批量/重建照常进行。WAL 压缩与重建会**以最老的活跃导出 pin 为下界**
+  保留历史（见 6 节），保证活跃导出始终能精确重建自己的视图；未 COMMIT 的批次
+  （含压缩尾部逐字保留的“撕裂事务”）在任何历史版本物化时都不可见。
+
+### 与原有“固定版本翻页”的兼容关系
+
+两者并存、互不影响，按场景选用：
+
+| | 固定版本翻页（`snapshotVersion` 字段） | 可续跑导出（`/exports`） |
+|---|---|---|
+| 形态 | 无状态：客户端回传版本号 | 有会话：exportId + 凭据，服务端持久化进度 |
+| 有效期 | 仅最近 `retained-versions` 个**内存版本节点**，进程重启即失效 | 受会话 TTL/空闲超时与 WAL 历史保留约束，**可跨重启** |
+| 适用 | 一次查询的翻页（秒级） | 批量导出、对账（分钟～小时级，可能跨重启） |
+| 顺序 | 相关度排序（score→seq→id） | 全量数据集，id 字典序（稳定、可复现） |
+
+固定版本翻页行为完全不变；可续跑导出是新增的独立 API 与独立持久化文件。
+
+---
+
 ## 5. 资源上限与降级策略
 
 在 `application.properties`（或同名环境变量）配置：
@@ -157,8 +229,32 @@ curl localhost:8080/admin/stats             # 版本、存活对象数、拒绝/
 | `vector-search.max-objects` | `VECTOR_SEARCH_MAX_OBJECTS` | 100000 | 存活对象数硬上限；达到后新增写入返回 `RESOURCE_LIMIT_REACHED`（幂等重写不受影响） |
 | `vector-search.max-query-candidates` | `VECTOR_SEARCH_MAX_QUERY_CANDIDATES` | 10000 | 单次查询允许参与打分的最大候选数 |
 | `vector-search.query-limit-policy` | `VECTOR_SEARCH_QUERY_POLICY` | DEGRADE | `REJECT`：超限直接拒绝（`QUERY_REJECTED_LIMIT`）；`DEGRADE`：只在上限内计算并返回 `degraded=true` 与 `degradeReason` |
-| `vector-search.data-dir` | `VECTOR_SEARCH_DATA_DIR` | `./data/vector-search` | WAL 数据目录 |
+| `vector-search.data-dir` | `VECTOR_SEARCH_DATA_DIR` | `./data/vector-search` | WAL 数据目录（导出会话日志 `export-sessions.log` 也在此目录） |
 | `vector-search.retained-versions` | — | 8 | 为快照分页保留的历史版本数（也是版本链压实深度） |
+| `vector-search.export-max-sessions` | `VECTOR_SEARCH_EXPORT_MAX_SESSIONS` | 64 | 同时存在的**活跃导出会话数**上限；到顶拒绝新发起（`EXPORT_LIMIT_REACHED`），结束/取消/过期后名额释放 |
+| `vector-search.export-max-session-records` | `VECTOR_SEARCH_EXPORT_MAX_SESSION_RECORDS` | 100000 | **单个导出会话**绑定视图的最大记录数（单会话占用上限）；超过则拒绝发起 |
+| `vector-search.export-default-page-size` | `VECTOR_SEARCH_EXPORT_DEFAULT_PAGE_SIZE` | 500 | 导出默认页大小 |
+| `vector-search.export-max-page-size` | `VECTOR_SEARCH_EXPORT_MAX_PAGE_SIZE` | 5000 | 允许请求的最大页大小，超过返回 `INVALID_PAGINATION` |
+| `vector-search.export-idle-timeout-millis` | `VECTOR_SEARCH_EXPORT_IDLE_TIMEOUT_MS` | 3600000 | 会话**空闲超时**：超过该时长没有拉页即失效（`EXPORT_EXPIRED`，原因 IDLE_TIMEOUT） |
+| `vector-search.export-ttl-millis` | `VECTOR_SEARCH_EXPORT_TTL_MS` | 86400000 | 会话**绝对寿命**：自发起时刻起无论是否活跃都会失效（原因 TTL_EXPIRED） |
+| `vector-search.export-sweep-interval-millis` | `VECTOR_SEARCH_EXPORT_SWEEP_INTERVAL_MS` | 60000 | 后台过期扫描间隔；`<=0` 关闭后台扫描（仍在访问时惰性判定过期） |
+| `vector-search.export-session-log-compact-threshold` | `VECTOR_SEARCH_EXPORT_LOG_COMPACT_THRESHOLD` | 10000 | 会话事件日志条数超过该值时自动压缩（每会话只留最新状态）；`<=0` 关闭 |
+
+### 导出会话生命周期
+
+状态机：`ACTIVE → COMPLETED | CANCELLED | EXPIRED`（终态不可逆，结束/取消操作幂等）。
+
+- **正常结束**：所有页拉完（最后一页 `finished=true`）后调用
+  `POST /exports/{id}/complete`；结束后再拉页返回 `EXPORT_FINISHED`。
+- **主动取消**：`POST /exports/{id}/cancel`，立即释放该会话占用与固定的历史版本。
+- **超时失效**：空闲超时或绝对 TTL 到点，由后台扫描线程（或下一次访问时的惰性判定）
+  标记为 `EXPIRED`。
+- **容量策略**：固定为**拒绝策略（REJECT）**——活跃会话数到顶时新发起直接返回
+  `EXPORT_LIMIT_REACHED`，不会驱逐或静默截断已存在的导出；单会话视图超过
+  `export-max-session-records` 同样在发起时拒绝。
+- **可观测**：每一次发起、拉页、结束、取消、过期与拒绝都有结构化日志，带
+  `exportId`、绑定版本、页数与 `reason=`（如 `MAX_SESSIONS`、`SESSION_VIEW_TOO_LARGE`、
+  `IDLE_TIMEOUT`、`TTL_EXPIRED`、`CREDENTIAL_NOT_FOUND`、`SNAPSHOT_UNAVAILABLE`）。
 
 降级时响应可与正常结果区分（`degraded=true` + 原因），并在日志中以
 `reason=QUERY_CANDIDATE_LIMIT` 记录快照版本、候选数与上限。拒绝写入/查询也都有
@@ -180,8 +276,19 @@ curl localhost:8080/admin/stats             # 版本、存活对象数、拒绝/
 - 恢复后的检索结果与崩溃前一致：同一确定性排序总键 + 墓碑持久化保证结果可复现。
 - WAL 可在重建/维护时压缩：把“当前存活集合 + 全部墓碑”重写到新日志，
   fsync 后原子替换（并对目录 fsync），删除不会因压缩而复活。
+- **保留式压缩（为可续跑导出服务）**：当存在活跃导出时，重建触发的压缩不再把历史
+  全部折叠，而是以**最老活跃导出绑定的版本（pin）为下界**：
+  新日志依次为 `BASE(下界标记) → 下界版本视图快照事务 → 原 WAL 中 seq 更大的原始行
+  （逐字保留）→ 仍需保留的墓碑`。因此 pin 及之后的每个版本视图在压缩（及重启）后
+  仍可精确重建；只有早于下界、且没有任何活跃导出使用的版本才会被折叠。
+  没有任何活跃导出时才做完全折叠（等价于历史版本全部到期）。
+- **历史版本物化**：导出续跑时通过重放 WAL（`seq<=目标版本` 的已确认记录，
+  以事务 `COMMIT` 的 seq 作为整批可见点）在内存重建该版本视图，不依赖进程内版本链；
+  未 COMMIT 的事务（含崩溃留下的撕裂尾、压缩尾部逐字保留的未完成批次）在任何版本都
+  不可见。目标版本早于压缩下界（`BASE`）会得到可区分的 `EXPORT_SNAPSHOT_UNAVAILABLE`。
 
-数据目录布局：`${data-dir}/vector-search.wal`。
+数据目录布局：`${data-dir}/vector-search.wal`（数据）与
+`${data-dir}/export-sessions.log`（导出会话事件，独立 fsync）。
 
 ---
 
@@ -205,6 +312,16 @@ mvn test
 - **资源/降级**：达到对象上限拒绝；REJECT 策略拒绝大候选查询；
   DEGRADE 策略返回 `degraded=true` 且记录日志
 - **崩溃恢复**：已确认写入不丢、未 COMMIT 事务不可见、撕裂尾被截断、压缩后墓碑不复活
+- **可续跑导出**：
+  - 发起/逐页续跑/同页重复一致、过滤视图固定；发起后的写入与删除不污染结果
+  - **跨重启续跑**：重启后凭原 exportId + 凭据继续，页码/内容与未重启一致，
+    已确认拉页进度不丢；结束态也持久化
+  - 生命周期：正常结束 / 主动取消 / 空闲超时与绝对 TTL 失效，失败原因彼此可区分
+  - **并发**：导出与并发写入/删除/重建同时进行，不重不漏、不出现半成品批次、
+    绑定版本始终不变；重建保留式压缩后导出仍可续，完全压缩后旧 pin 得到可区分失败
+  - **容量**：活跃会话数到顶拒绝（`MAX_SESSIONS`）、单会话视图超限拒绝
+    （`SESSION_VIEW_TOO_LARGE`），拒绝均带 `exportId`/`reason` 可观测记录
+  - 历史版本物化：任意历史版本可重建；未提交交错事务、压缩切过半开批次时不泄露半成品
 
 手工端到端验证（写入→检索→删除→重建→重启）：
 
@@ -213,6 +330,28 @@ mvn package -DskipTests
 VECTOR_SEARCH_DATA_DIR=$(pwd)/data java -jar target/vector-search-java-1.0-SNAPSHOT.jar
 # 另一个终端执行第 3 节的 curl；Ctrl+C 后再次启动，数据与删除状态仍然保留
 ```
+
+手工验证可续跑导出（含跨重启）：
+
+```bash
+# 0) 造一批数据
+for i in $(seq 1 20); do
+  curl -s -X POST localhost:8080/vectors/raw -H 'Content-Type: application/json' \
+    -d "{\"id\":\"doc$i\",\"vector\":[$(yes 0.1 | head -64 | paste -sd, -)]}" >/dev/null
+done
+# 1) 发起导出，记下 id 与 credential
+curl -s -X POST localhost:8080/exports -H 'Content-Type: application/json' -d '{"pageSize":5}'
+# 2) 发起之后再写入/删除（导出结果不应受影响）
+# 3) 拉第 1 页 → 停掉服务（Ctrl+C）→ 重新启动 → 凭同一凭据继续拉第 2..N 页
+curl -s localhost:8080/exports/<id>/pages/2 -H 'X-Export-Credential: <credential>'
+# 4) 全部页拼起来应恰好是发起时的 20 条、id 升序、无重复；最后 finished=true
+# 5) 显式结束；再拉同一页应返回 410 EXPORT_FINISHED
+curl -s -X POST localhost:8080/exports/<id>/complete -H 'X-Export-Credential: <credential>'
+```
+
+并发与重建保活可通过把 `vector-search.compact-threshold` 调到很小（如 1）后，
+在长导出期间反复 `POST /admin/rebuild` 与写入/删除来手工压测；活跃导出的页码与内容
+应保持不变。
 
 日志默认同时输出到控制台与 `./logs/vector-search.log`，日志行包含**线程名、
 快照版本（snapshotVersion）、拒绝原因（reason=...）与降级依据**，便于回放并发时序。
@@ -232,4 +371,10 @@ VECTOR_SEARCH_DATA_DIR=$(pwd)/data java -jar target/vector-search-java-1.0-SNAPS
 | `INVALID_PAGINATION` | limit/offset 非法，或快照版本已过期 |
 | `INVALID_FILTER` | 过滤字段/取值非法（含保留前缀 `_`） |
 | `REBUILD_FAILED` | 重建失败（已回退到旧版本） |
-| `PERSISTENCE_FAILURE` | WAL 持久化 IO 失败 |
+| `EXPORT_LIMIT_REACHED` | 并发导出会话数或单会话视图占用达到上限（429） |
+| `EXPORT_NOT_FOUND` | 导出 id 未知或凭据不匹配（404） |
+| `EXPORT_EXPIRED` | 导出会话空闲超时或绝对寿命到期（410） |
+| `EXPORT_CANCELLED` | 导出会话已被主动取消（410） |
+| `EXPORT_FINISHED` | 导出会话已正常结束（410） |
+| `EXPORT_SNAPSHOT_UNAVAILABLE` | 绑定的数据视图已超出保留期、无法物化（410） |
+| `PERSISTENCE_FAILURE` | WAL / 会话日志持久化 IO 失败 |

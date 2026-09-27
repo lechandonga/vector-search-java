@@ -2,6 +2,10 @@ package com.github.lechandonga.vectorsearchjava.web;
 
 import com.github.lechandonga.vectorsearchjava.error.ApiException;
 import com.github.lechandonga.vectorsearchjava.error.ErrorCode;
+import com.github.lechandonga.vectorsearchjava.export.ExportPage;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionInfo;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionManager;
+import com.github.lechandonga.vectorsearchjava.export.ExportedRecord;
 import com.github.lechandonga.vectorsearchjava.index.SearchFilter;
 import com.github.lechandonga.vectorsearchjava.index.SearchHit;
 import com.github.lechandonga.vectorsearchjava.index.SearchResult;
@@ -34,6 +38,11 @@ import java.util.Map;
  * POST   /search/text            文本相似度检索
  * POST   /admin/rebuild          重建索引（原子切换，失败回退）
  * GET    /admin/stats            观测指标（版本、拒绝/降级计数）
+ * POST   /exports                发起可续跑导出（返回 exportId + 凭据，绑定数据视图）
+ * GET    /exports/{id}/pages/{p} 凭凭据续跑第 p 页（X-Export-Credential 头）
+ * GET    /exports/{id}           查询导出会话状态/进度
+ * POST   /exports/{id}/cancel    主动取消导出
+ * POST   /exports/{id}/complete  正常结束导出
  * </pre>
  */
 @RestController
@@ -115,6 +124,99 @@ class VectorController {
     ApiDtos.RebuildResponse rebuild() {
         RebuildResult r = service.rebuild();
         return new ApiDtos.RebuildResponse(r.fromVersion(), r.toVersion(), r.objectCount());
+    }
+
+    // ------------------------------------------------------- 可续跑导出
+
+    /** 发起导出：返回 exportId 与长期续跑凭据，绑定发起时刻的数据视图。 */
+    @PostMapping("/exports")
+    Map<String, Object> startExport(@RequestBody(required = false) ApiDtos.ExportStartRequest req) {
+        Integer pageSize = req == null ? null : req.pageSize();
+        Map<String, String> filter = req == null ? null : req.filter();
+        ExportSessionManager.StartResult r =
+                service.startExport(SearchFilter.of(filter), pageSize);
+        Map<String, Object> body = sessionBody(r.info());
+        body.put("credential", r.credential());
+        return body;
+    }
+
+    /** 续跑一页：凭据通过 X-Export-Credential 头回传，页号从 1 开始。 */
+    @GetMapping("/exports/{id}/pages/{page}")
+    Map<String, Object> fetchExportPage(@org.springframework.web.bind.annotation.PathVariable String id,
+                                        @org.springframework.web.bind.annotation.PathVariable int page,
+                                        @org.springframework.web.bind.annotation.RequestHeader(
+                                                value = "X-Export-Credential", required = false)
+                                        String credential) {
+        ExportPage r = service.fetchExportPage(id, credential, page);
+        List<Map<String, Object>> records = new ArrayList<>(r.records().size());
+        for (ExportedRecord rec : r.records()) {
+            List<Double> vec = new ArrayList<>(rec.vector().length);
+            for (float v : rec.vector()) {
+                vec.add((double) v);
+            }
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id", rec.id());
+            m.put("vector", vec);
+            m.put("source", rec.source().name());
+            m.put("text", rec.text());
+            m.put("metadata", rec.metadata());
+            m.put("sequence", rec.sequence());
+            records.add(m);
+        }
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("exportId", r.exportId());
+        body.put("snapshotVersion", r.snapshotVersion());
+        body.put("page", r.page());
+        body.put("pageSize", r.pageSize());
+        body.put("totalRecords", r.totalRecords());
+        body.put("totalPages", Math.max(1, (r.totalRecords() + r.pageSize() - 1) / r.pageSize()));
+        body.put("finished", r.finished());
+        body.put("records", records);
+        return body;
+    }
+
+    /** 查询会话状态/进度。 */
+    @GetMapping("/exports/{id}")
+    Map<String, Object> exportStatus(@org.springframework.web.bind.annotation.PathVariable String id,
+                                     @org.springframework.web.bind.annotation.RequestHeader(
+                                             value = "X-Export-Credential", required = false)
+                                     String credential) {
+        return sessionBody(service.exportStatus(id, credential));
+    }
+
+    /** 主动取消导出会话。 */
+    @PostMapping("/exports/{id}/cancel")
+    Map<String, Object> cancelExport(@org.springframework.web.bind.annotation.PathVariable String id,
+                                     @org.springframework.web.bind.annotation.RequestHeader(
+                                             value = "X-Export-Credential", required = false)
+                                     String credential) {
+        return sessionBody(service.cancelExport(id, credential));
+    }
+
+    /** 正常结束导出会话（所有页已拉完后的显式确认）。 */
+    @PostMapping("/exports/{id}/complete")
+    Map<String, Object> completeExport(@org.springframework.web.bind.annotation.PathVariable String id,
+                                       @org.springframework.web.bind.annotation.RequestHeader(
+                                               value = "X-Export-Credential", required = false)
+                                       String credential) {
+        return sessionBody(service.completeExport(id, credential));
+    }
+
+    private static Map<String, Object> sessionBody(ExportSessionInfo i) {
+        int totalPages = Math.max(1, (i.totalRecords() + i.pageSize() - 1) / i.pageSize());
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("exportId", i.id());
+        body.put("snapshotVersion", i.snapshotVersion());
+        body.put("pageSize", i.pageSize());
+        body.put("filter", i.filter());
+        body.put("state", i.state().name());
+        body.put("totalRecords", i.totalRecords());
+        body.put("totalPages", totalPages);
+        body.put("lastDeliveredPage", i.lastDeliveredPage());
+        body.put("createdAt", i.createdAtMillis());
+        body.put("expiresAt", i.expiresAtMillis());
+        body.put("lastAccessAt", i.lastAccessMillis());
+        return body;
     }
 
     @GetMapping("/admin/stats")

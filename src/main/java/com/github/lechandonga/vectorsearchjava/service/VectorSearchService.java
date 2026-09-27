@@ -4,6 +4,10 @@ import com.github.lechandonga.vectorsearchjava.config.VectorSearchProperties;
 import com.github.lechandonga.vectorsearchjava.embedding.TextEmbedder;
 import com.github.lechandonga.vectorsearchjava.error.ApiException;
 import com.github.lechandonga.vectorsearchjava.error.ErrorCode;
+import com.github.lechandonga.vectorsearchjava.export.ExportPage;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionInfo;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionManager;
+import com.github.lechandonga.vectorsearchjava.export.ExportSessionStore;
 import com.github.lechandonga.vectorsearchjava.index.SearchFilter;
 import com.github.lechandonga.vectorsearchjava.index.SearchResult;
 import com.github.lechandonga.vectorsearchjava.index.VectorIndex;
@@ -59,6 +63,9 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
     /** 重建互斥：避免多个重建并发进行。 */
     private final Object rebuildLock = new Object();
 
+    /** 可续跑导出会话管理器（持久化会话日志 + 绑定历史版本视图）。 */
+    private final ExportSessionManager exportManager;
+
     private long totalWrites;
     private long totalDeletes;
     private long rejectedWrites;
@@ -77,11 +84,73 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
         this.embedder = new TextEmbedder(props.getDimension());
         this.retainedVersions = Math.max(2, props.getRetainedVersions());
         publishSnapshotIndex(store.snapshot());
+        this.exportManager = createExportManager();
         log.info("VectorSearchService started. dimension={} maxObjects={} maxQueryCandidates={} "
                         + "policy={} wal={} recoveredVersion={} recoveredObjects={}",
                 props.getDimension(), props.getMaxObjects(), props.getMaxQueryCandidates(),
                 props.getQueryLimitPolicy(), props.getDataDir(),
                 current.get().version(), current.get().size());
+    }
+
+    /** 构建导出会话管理器；抽成 protected 便于测试注入时钟等。 */
+    protected ExportSessionManager createExportManager() {
+        Path sessionLog = Path.of(props.getDataDir(), "export-sessions.log");
+        try {
+            ExportSessionStore sessionStore = new ExportSessionStore(sessionLog);
+            ExportSessionManager.ViewProvider provider = new ExportSessionManager.ViewProvider() {
+                @Override
+                public List<VectorRecord> materialize(long version) {
+                    return store.materializeAtVersion(version);
+                }
+
+                @Override
+                public long currentVersion() {
+                    return current.get().version();
+                }
+            };
+            return new ExportSessionManager(sessionStore, provider, props);
+        } catch (IOException e) {
+            throw new ApiException(ErrorCode.PERSISTENCE_FAILURE,
+                    "failed to open export session log at " + sessionLog, e);
+        }
+    }
+
+    // ------------------------------------------------------------ 可续跑导出
+
+    /** 发起一次绑定当前数据视图的导出会话，返回长期续跑凭据。 */
+    public ExportSessionManager.StartResult startExport(SearchFilter filter, Integer pageSize) {
+        try {
+            return exportManager.start(filter, pageSize);
+        } catch (java.io.UncheckedIOException uio) {
+            throw new ApiException(ErrorCode.PERSISTENCE_FAILURE,
+                    "failed to materialize export snapshot: " + uio.getMessage(), uio);
+        }
+    }
+
+    /** 凭凭据续跑一页；同一页重复拉取结果一致，进度跨重启不丢。 */
+    public ExportPage fetchExportPage(String exportId, String credential, int page) {
+        try {
+            return exportManager.fetch(exportId, credential, page);
+        } catch (java.io.UncheckedIOException uio) {
+            throw new ApiException(ErrorCode.PERSISTENCE_FAILURE,
+                    "failed to read export snapshot: " + uio.getMessage(), uio);
+        }
+    }
+
+    public ExportSessionInfo completeExport(String exportId, String credential) {
+        return exportManager.complete(exportId, credential);
+    }
+
+    public ExportSessionInfo cancelExport(String exportId, String credential) {
+        return exportManager.cancel(exportId, credential);
+    }
+
+    public ExportSessionInfo exportStatus(String exportId, String credential) {
+        return exportManager.status(exportId, credential);
+    }
+
+    public ExportSessionManager exportManager() {
+        return exportManager;
     }
 
     // ------------------------------------------------------------------ 写入
@@ -418,7 +487,11 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
                     long threshold = props.getCompactThreshold();
                     if (threshold > 0 && store.walEntryCount() > threshold) {
                         try {
-                            store.compact();
+                            // 压缩必须保住所有仍活跃导出绑定的历史视图：
+                            // 以最老活跃 pin 为下界折叠，导出续跑不受压缩影响
+                            long preserve = exportManager.oldestActiveVersion();
+                            store.compact(preserve);
+                            exportManager.notifyCompaction(preserve < 0 ? snap.version() : preserve);
                             compacted = true;
                         } catch (IOException ioe) {
                             // 压缩失败不影响索引正确性（WAL 只是变大），记录后继续
@@ -453,7 +526,11 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
 
     @Override
     public void destroy() throws Exception {
-        store.close();
+        try {
+            exportManager.close();
+        } finally {
+            store.close();
+        }
     }
 
     @Override
