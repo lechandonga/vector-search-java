@@ -107,6 +107,11 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
                 public long currentVersion() {
                     return current.get().version();
                 }
+
+                @Override
+                public long retentionFloor() {
+                    return store.historyFloor();
+                }
             };
             return new ExportSessionManager(sessionStore, provider, props);
         } catch (IOException e) {
@@ -482,26 +487,42 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
                 mutationRwLock.writeLock().lock();
                 boolean compacted = false;
                 try {
-                    current.set(rebuilt);
-                    retain(rebuilt);
                     long threshold = props.getCompactThreshold();
                     if (threshold > 0 && store.walEntryCount() > threshold) {
+                        // “折叠 WAL → 发布新当前版本”在导出协调锁的同一临界区内完成：
+                        // 折叠后立即发布压缩后的快照索引，保证任何发起路径随后读到的
+                        // currentVersion() 都不早于新下界。若先发布旧版本再折叠，
+                        // 全量压缩（无活跃 pin）会把 WAL 下界推到已发布版本之后，
+                        // 恰好卡在窗口里发起的导出会拿到“已超出保留期”的版本号，
+                        // 凭据第一页即 410。
                         try {
-                            // 压缩必须保住所有仍活跃导出绑定的历史视图：
-                            // 以最老活跃 pin 为下界折叠，导出续跑不受压缩影响
-                            long preserve = exportManager.oldestActiveVersion();
-                            store.compact(preserve);
-                            exportManager.notifyCompaction(preserve < 0 ? snap.version() : preserve);
+                            // 压缩必须保住所有仍活跃导出绑定的历史视图。
+                            // “读最老活跃 pin → 折叠 WAL → 清理视图缓存”在导出管理器的
+                            // 协调锁内一次完成，与导出发起的“取版本→注册”互为原子：
+                            // 只要发起成功返回凭据，其 pin 版本就不会被这次或之后的
+                            // 压缩折叠，凭据永远可以拉页。
+                            exportManager.runCoordinatedCompaction(store::compact, newFloor -> {
+                                DurableStore.StoreSnapshot after = store.snapshot();
+                                VectorIndex published = buildIndex(after);
+                                current.set(published);
+                                retain(published);
+                            });
                             compacted = true;
-                        } catch (IOException ioe) {
-                            // 压缩失败不影响索引正确性（WAL 只是变大），记录后继续
+                        } catch (IOException | RuntimeException ex) {
+                            // 压缩/再构建失败：索引正确性不受影响，退化为只发布原重建结果
                             log.warn("WAL compaction after rebuild failed, continuing: {}",
-                                    ioe.getMessage());
+                                    ex.getMessage());
+                            current.set(rebuilt);
+                            retain(rebuilt);
                         }
+                    } else {
+                        current.set(rebuilt);
+                        retain(rebuilt);
                     }
                 } finally {
                     mutationRwLock.writeLock().unlock();
                 }
+                snap = store.snapshot(); // 压缩后可能已发布更新的快照版本，结果按实际发布回报
                 log.info("index rebuilt and published atomically. fromVersion={} toVersion={} "
                         + "objects={} compacted={}",
                         fromVersion, snap.version(), snap.liveRecords().size(), compacted);

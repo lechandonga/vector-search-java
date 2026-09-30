@@ -5,5 +5,7 @@ public enum ExportState {
     ACTIVE,
     COMPLETED,
     CANCELLED,
-    EXPIRED
+    EXPIRED,
+    /** 绑定的数据版本已被维护性压缩折叠（超出历史保留期）：固定、可区分、跨重启一致。 */
+    RETENTION_EXPIRED
 }

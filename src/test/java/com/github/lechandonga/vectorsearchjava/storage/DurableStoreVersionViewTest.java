@@ -7,6 +7,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -234,6 +241,78 @@ class DurableStoreVersionViewTest {
             assertTrue(latest.contains("c"));
             assertTrue(!latest.contains("ghost1"));
             assertTrue(!latest.contains("ghost2"));
+        }
+    }
+
+    /**
+     * 历史物化读走独立只读通道：在并发写入（不断 append+fsync）与反复保留式压缩
+     * （不断原子换文件）的夹击下，物化调用要么精确重建某个被 pin 的视图，
+     * 要么抛 {@link SnapshotUnavailableException}，绝不允许抛出底层 IO 异常
+     * （例如读到压缩换文件的移动窗口）或返回错视图。
+     */
+    @Test
+    void materializationConcurrentWithWritesAndPreservingCompactionsIsSafe(@TempDir Path dir)
+            throws Exception {
+        try (DurableStore store = new DurableStore(dir.resolve("w.wal"))) {
+            final long[] pinHolder = {0L};
+            for (int i = 0; i < 30; i++) {
+                long seq = store.put("d" + i, v(1), com.github.lechandonga.vectorsearchjava.model.VectorSource.RAW, null, Map.of()).sequence();
+                if (i == 14) {
+                    pinHolder[0] = seq;
+                }
+            }
+            final long pin = pinHolder[0];
+            ExecutorService pool = Executors.newFixedThreadPool(3);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            List<Future<?>> futures = new ArrayList<>();
+            // 写入线程
+            futures.add(pool.submit((Callable<Void>) () -> {
+                try {
+                    for (int i = 0; i < 200; i++) {
+                        store.put("c" + i, v(1), com.github.lechandonga.vectorsearchjava.model.VectorSource.RAW, null, Map.of());
+                        if (i % 7 == 0) {
+                            store.delete("d" + (i % 30));
+                        }
+                    }
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+                return null;
+            }));
+            // 压缩线程：始终保住 pin，物化 pin 永远应成功
+            futures.add(pool.submit((Callable<Void>) () -> {
+                try {
+                    for (int i = 0; i < 40; i++) {
+                        store.compact(pin);
+                    }
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+                return null;
+            }));
+            // 物化线程：pin 视图固定为 d0..d14（15 条，id 升序）
+            futures.add(pool.submit((Callable<Void>) () -> {
+                try {
+                    List<String> expected = new ArrayList<>();
+                    for (int i = 0; i <= 14; i++) {
+                        expected.add("d" + i);
+                    }
+                    expected.sort(String::compareTo); // 物化视图按 id 字典序
+                    for (int i = 0; i < 200; i++) {
+                        assertEquals(expected, ids(store.materializeAtVersion(pin)));
+                    }
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+                return null;
+            }));
+            for (Future<?> f : futures) {
+                f.get();
+            }
+            pool.shutdown();
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
         }
     }
 }

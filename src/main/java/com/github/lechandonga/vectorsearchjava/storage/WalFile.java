@@ -89,14 +89,42 @@ public class WalFile implements AutoCloseable {
     /**
      * 读取全部原始行（不做校验/解析）。并发追加期间调用时，末尾可能出现撕裂行——
      * 调用方按 {@link WalCodec#decode} 自行截断尾部即可；空行跳过。
+     *
+     * <p><b>并发模型</b>：每次调用打开<b>独立的只读通道</b>，不与 append 共用写锁，
+     * 因此导出/压缩扫描历史 WAL 不会阻塞并发写入的 fsync 确认。若读取期间发生
+     * {@link #replaceWith} 压缩换文件，本通道要么读到替换前的完整旧文件（旧 inode
+     * 在通道关闭前保持可读），要么读到替换后的新文件——两者对同一被 pin 版本
+     * 物化出的视图完全一致；极端时序下文件暂时缺失时抛出 {@link java.nio.file.NoSuchFileException}，
+     * 由上层重试。
      */
     public List<String> readRawLines() throws IOException {
-        List<String> lines;
-        synchronized (writeLock) {
-            // 与压缩替换互斥：替换期间直接读可能撞到文件移动窗口
-            lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        // 独立只读通道：绝不取 writeLock，避免大 WAL 的历史扫描串行化所有写入
+        try (FileChannel reader = FileChannel.open(file, StandardOpenOption.READ)) {
+            java.nio.ByteBuffer all = java.nio.ByteBuffer.allocate((int) reader.size());
+            while (all.hasRemaining()) {
+                int n = reader.read(all);
+                if (n < 0) {
+                    break;
+                }
+            }
+            String content = new String(all.array(), 0, all.position(),
+                    StandardCharsets.UTF_8);
+            if (content.isEmpty()) {
+                return new ArrayList<>();
+            }
+            List<String> lines = new ArrayList<>();
+            int start = 0;
+            for (int i = 0; i < content.length(); i++) {
+                if (content.charAt(i) == '\n') {
+                    lines.add(content.substring(start, i));
+                    start = i + 1;
+                }
+            }
+            if (start < content.length()) {
+                lines.add(content.substring(start));
+            }
+            return lines;
         }
-        return lines;
     }
 
     /**

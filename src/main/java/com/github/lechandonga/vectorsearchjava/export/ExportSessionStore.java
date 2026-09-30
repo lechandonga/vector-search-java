@@ -38,7 +38,8 @@ public class ExportSessionStore implements AutoCloseable {
         PAGE,
         COMPLETED,
         CANCELLED,
-        EXPIRED
+        EXPIRED,
+        RETENTION_EXPIRED
     }
 
     /** 一条会话事件（不可变）。 */

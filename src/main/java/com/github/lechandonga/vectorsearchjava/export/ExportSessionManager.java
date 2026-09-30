@@ -10,6 +10,7 @@ import com.github.lechandonga.vectorsearchjava.storage.SnapshotUnavailableExcept
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -49,6 +50,15 @@ public class ExportSessionManager implements AutoCloseable {
 
         /** 当前最新版本号。 */
         long currentVersion();
+
+        /**
+         * 当前数据 WAL 仍可物化出的最老版本（历史保留下界）；0 表示全部历史可用。
+         * 管理器据此给出<b>只取决于已持久化状态</b>的保留期判定，保证重启前后、
+         * 以及并发时序下的结论一致。
+         */
+        default long retentionFloor() {
+            return 0L;
+        }
     }
 
     /** 发起结果：含一次性的明文凭据，此后只凭它续跑。 */
@@ -73,6 +83,16 @@ public class ExportSessionManager implements AutoCloseable {
     private final ConcurrentHashMap<Long, Object> viewLocks = new ConcurrentHashMap<>();
     /** 会话事件计数（用于会话日志压缩阈值）。 */
     private final AtomicLong eventCount = new AtomicLong();
+
+    /**
+     * “版本 pin ↔ WAL 压缩折叠”协调锁。
+     *
+     * <p>导出发起（取版本→物化→会话注册可被压缩发现）与数据 WAL 压缩（读取最老活跃
+     * pin→折叠历史→通知缓存）必须互为原子，否则存在窗口：发起已拿到凭据、但会话尚未
+     * 进入注册表时，压缩以“无活跃 pin”完全折叠历史，凭据拉第一页即 410。
+     * 该锁只覆盖这两个极短决策段；物化（重放 WAL）不持本锁，也不阻塞数据写入。
+     */
+    private final Object pinLock = new Object();
 
     private final ScheduledExecutorService sweeper;
     private final Clock clock;
@@ -123,21 +143,31 @@ public class ExportSessionManager implements AutoCloseable {
         }
 
         long now = clock.millis();
-        long version;
-        List<VectorRecord> view;
-        synchronized (sessions) {
-            // 容量上限与版本抓取放在同一临界区，避免“检查后通过但实际超额”
-            long active = sessions.values().stream()
-                    .filter(s -> s.isActiveAt(now, props.getExportIdleTimeoutMillis()))
-                    .count();
+        // 与数据 WAL 压缩互为原子（全局统一锁序：pinLock -> sessions）：
+        // 从“取版本→物化→会话注册可被压缩发现”全程持 pinLock，压缩无法在此期间折叠
+        // 该版本历史，杜绝“凭据已返回但 pin 视图已被全量压缩”的 410 竞态。
+        // pinLock 不保护数据写入（WAL append/fsync 完全不经过它），
+        // 且物化读 WAL 走独立只读通道，因此并发写入/删除吞吐不受影响。
+        synchronized (pinLock) {
+            long version;
+            List<VectorRecord> view;
+            long active;
+            synchronized (sessions) {
+                // 容量上限检查与版本抓取放在同一临界区，避免“检查后通过但实际超额”
+                active = sessions.values().stream()
+                        .filter(s -> s.isActiveAt(now, props.getExportIdleTimeoutMillis()))
+                        .count();
+            }
             if (active >= props.getExportMaxSessions()) {
                 recordRejection(null, "MAX_SESSIONS",
                         "active=" + active + " max=" + props.getExportMaxSessions());
                 throw new ApiException(ErrorCode.EXPORT_LIMIT_REACHED,
-                        "active export session limit reached: " + props.getExportMaxSessions());
+                        "active export session limit reached: "
+                                + props.getExportMaxSessions());
             }
             version = viewProvider.currentVersion();
             try {
+                // 物化不持 sessions：压缩被 pinLock 挡在外面，pin 版本历史不可能消失
                 view = materializeView(version);
             } catch (SnapshotUnavailableException ex) {
                 recordRejection(null, "SNAPSHOT_UNAVAILABLE",
@@ -166,11 +196,31 @@ public class ExportSessionManager implements AutoCloseable {
 
             ExportSession session = new ExportSession(id, credential, hash, version, pageSize,
                     filterMap, ExportState.ACTIVE, total, 0, now, now, expiresAt);
-            persist(ExportSessionStore.EventType.CREATED, session, 0, now);
-            sessions.put(id, session);
-            log.info("export session created: exportId={} version={} pageSize={} totalRecords={} "
-                            + "filter={} activeSessions={}",
-                    id, version, pageSize, total, filterMap, active + 1);
+            synchronized (sessions) {
+                // 进入注册表后再次确认名额（物化期间锁未覆盖 sessions 变更）
+                long activeNow = sessions.values().stream()
+                        .filter(s -> s.isActiveAt(now, props.getExportIdleTimeoutMillis()))
+                        .count();
+                if (activeNow >= props.getExportMaxSessions()) {
+                    recordRejection(null, "MAX_SESSIONS",
+                            "active=" + activeNow + " max=" + props.getExportMaxSessions());
+                    releaseViewIfUnused(version);
+                    throw new ApiException(ErrorCode.EXPORT_LIMIT_REACHED,
+                            "active export session limit reached: "
+                                    + props.getExportMaxSessions());
+                }
+                try {
+                    persist(ExportSessionStore.EventType.CREATED, session, 0, now);
+                } catch (ApiException persistFailure) {
+                    // 发起失败不能留下占着会话名额/视图缓存的残留
+                    releaseViewIfUnused(version);
+                    throw persistFailure;
+                }
+                sessions.put(id, session);
+                log.info("export session created: exportId={} version={} pageSize={} "
+                                + "totalRecords={} filter={} activeSessions={}",
+                        id, version, pageSize, total, filterMap, activeNow + 1);
+            }
             return new StartResult(session.toInfo(), credential);
         }
     }
@@ -188,10 +238,11 @@ public class ExportSessionManager implements AutoCloseable {
         try {
             view = materializeView(s.snapshotVersion());
         } catch (SnapshotUnavailableException ex) {
-            // 视图历史被压缩清除（理论上压缩会按 pin 保留，此处是最终防线）
-            markUnavailable(s, ex.getMessage());
-            throw new ApiException(ErrorCode.EXPORT_SNAPSHOT_UNAVAILABLE,
-                    "export snapshot is no longer available: " + ex.getMessage(), ex);
+            // 最终防线：视图历史已被维护性压缩折叠。
+            // 落为持久化终态——之后（含重启后）重复请求得到完全相同的固定失败，
+            // 绝不在竞态下偶尔成功、偶尔 410。
+            s = markRetentionExpired(s, ex.getMessage());
+            throw stateError(s);
         }
         SearchFilter f = SearchFilter.of(s.filter());
         List<VectorRecord> matched = filterView(view, f);
@@ -269,6 +320,9 @@ public class ExportSessionManager implements AutoCloseable {
                 throw notFound(exportId);
             }
             if (s.state() == ExportState.ACTIVE) {
+                if (s.snapshotVersion() < viewProvider.retentionFloor()) {
+                    return markRetentionExpired(s, "status: precedes retention floor").toInfo();
+                }
                 if (!s.isActiveAt(now, props.getExportIdleTimeoutMillis())) {
                     return expireOne(s, now).toInfo();
                 }
@@ -329,30 +383,102 @@ public class ExportSessionManager implements AutoCloseable {
         return updated;
     }
 
-    private void markUnavailable(ExportSession s, String detail) {
+    /** 调用方须持有 sessions 监视器（本方法会自行获取）之外的语义：将会话落为保留期终态并持久化。 */
+    private ExportSession markRetentionExpired(ExportSession s, String detail) {
         synchronized (sessions) {
-            recordRejection(s.id(), "SNAPSHOT_UNAVAILABLE", detail);
-            releaseViewIfUnused(s.snapshotVersion());
+            ExportSession current = sessions.get(s.id());
+            if (current != null && current.state() == ExportState.RETENTION_EXPIRED) {
+                return current;
+            }
+            ExportSession updated = (current == null ? s : current)
+                    .withState(ExportState.RETENTION_EXPIRED, clock.millis());
+            sessions.put(updated.id(), updated);
+            persist(ExportSessionStore.EventType.RETENTION_EXPIRED, updated,
+                    updated.lastDeliveredPage(), clock.millis());
+            releaseViewIfUnused(updated.snapshotVersion());
+            recordRejection(updated.id(), "RETENTION_EXPIRED",
+                    "version=" + updated.snapshotVersion() + " floor="
+                            + viewProvider.retentionFloor()
+                            + (detail == null ? "" : " " + detail));
+            log.warn("export session retention-expired: exportId={} version={} floor={}",
+                    updated.id(), updated.snapshotVersion(), viewProvider.retentionFloor());
+            return updated;
         }
     }
 
     // ------------------------------------------------------------ 压缩协作
 
+    /** 数据 WAL 压缩动作：入参为需要保留的最老 pin 版本（&lt;=0 表示无活跃 pin，可全量折叠）；
+     *  返回压缩后实际的历史下界。 */
+    @FunctionalInterface
+    public interface CompactionAction {
+        long compact(long preserveFromVersion) throws IOException;
+    }
+
+    /** 折叠完成、仍在协调锁内执行的回调（用于发布与新下界一致的当前版本）。 */
+    @FunctionalInterface
+    public interface AfterCompaction {
+        void run(long newFloor);
+    }
+
+    /**
+     * 在 pin/压缩协调锁内执行一次数据 WAL 压缩（与 {@link #start} 互为原子）：
+     * <ol>
+     *     <li>先读出当前所有仍活跃会话 pin 的最老版本；</li>
+     *     <li>以该版本为下界执行折叠压缩——这期间不可能有新会话拿到更早版本，
+     *     因为发起路径要拿到同一把锁才能完成“取版本→注册”；</li>
+     *     <li>在同一临界区内执行 afterCompaction（服务层据此发布新的当前版本，
+     *     保证随后任何发起读到的版本号都不早于新下界），再清理物化视图缓存。</li>
+     * </ol>
+     * 因此：只要发起成功返回了凭据，其 pin 版本就永远不会被任何压缩折叠。
+     */
+    public long runCoordinatedCompaction(CompactionAction action) throws IOException {
+        return runCoordinatedCompaction(action, f -> {
+        });
+    }
+
+    /**
+     * 同 {@link #runCoordinatedCompaction(CompactionAction)}，但 {@code afterCompaction}
+     * 在同一协调临界区内、折叠完成后立即执行——调用方可在其中发布“当前版本”，
+     * 保证任何发起路径随后读到的 {@link ViewProvider#currentVersion()} 都不早于新下界。
+     */
+    public long runCoordinatedCompaction(CompactionAction action,
+                                         AfterCompaction afterCompaction) throws IOException {
+        synchronized (pinLock) {
+            long preserve = oldestActiveVersion();
+            long newFloor = action.compact(preserve < 0 ? 0L : preserve);
+            afterCompaction.run(newFloor);
+            // 只清理不再被任何会话引用的物化视图。活跃会话 pin 的版本必然 >= newFloor
+            // （折叠以它们为下界），其缓存必须保留：最小压缩阈值下重建非常频繁，
+            // 若每次都清空活跃 pin 视图，每页都要全量重放 WAL，开销平方级上涨。
+            pruneUnusedViews();
+            return newFloor;
+        }
+    }
+
     /** 仍活跃会话绑定的最老版本（无活跃会话时返回 -1），供数据 WAL 压缩保留历史。 */
     public long oldestActiveVersion() {
         long now = clock.millis();
         long oldest = Long.MAX_VALUE;
-        for (ExportSession s : sessions.values()) {
-            if (s.isActiveAt(now, props.getExportIdleTimeoutMillis())) {
-                oldest = Math.min(oldest, s.snapshotVersion());
+        synchronized (sessions) {
+            for (ExportSession s : sessions.values()) {
+                if (s.isActiveAt(now, props.getExportIdleTimeoutMillis())) {
+                    oldest = Math.min(oldest, s.snapshotVersion());
+                }
             }
         }
         return oldest == Long.MAX_VALUE ? -1L : oldest;
     }
 
-    /** 数据 WAL 压缩完成后调用：清理指向已失效版本的缓存。 */
-    public void notifyCompaction(long oldestReconstructableVersion) {
-        viewCache.keySet().removeIf(v -> v < oldestReconstructableVersion);
+    /** 清理不被任何会话（含终态会话的重复失败诊断）引用的物化视图缓存。 */
+    private void pruneUnusedViews() {
+        java.util.Set<Long> referenced = new java.util.HashSet<>();
+        synchronized (sessions) {
+            for (ExportSession s : sessions.values()) {
+                referenced.add(s.snapshotVersion());
+            }
+        }
+        viewCache.keySet().removeIf(v -> !referenced.contains(v));
     }
 
     public List<RejectionEvent> recentRejections() {
@@ -368,6 +494,12 @@ public class ExportSessionManager implements AutoCloseable {
                 throw notFound(exportId);
             }
             if (s.state() == ExportState.ACTIVE) {
+                // 保留期判定优先于空闲/TTL：它只取决于持久化压缩下界，是确定事实；
+                // 空闲判定基于时钟，放其后。
+                if (s.snapshotVersion() < viewProvider.retentionFloor()) {
+                    s = markRetentionExpired(s, "fetch: precedes retention floor");
+                    throw stateError(s);
+                }
                 if (!s.isActiveAt(now, props.getExportIdleTimeoutMillis())) {
                     s = expireOne(s, now);
                     throw stateError(s);
@@ -408,12 +540,15 @@ public class ExportSessionManager implements AutoCloseable {
             case EXPIRED -> ErrorCode.EXPORT_EXPIRED;
             case CANCELLED -> ErrorCode.EXPORT_CANCELLED;
             case COMPLETED -> ErrorCode.EXPORT_FINISHED;
+            case RETENTION_EXPIRED -> ErrorCode.EXPORT_SNAPSHOT_UNAVAILABLE;
             default -> ErrorCode.EXPORT_NOT_FOUND;
         };
         String msg = switch (s.state()) {
             case EXPIRED -> "export session expired at " + s.expiresAtMillis();
             case CANCELLED -> "export session was cancelled";
             case COMPLETED -> "export session already completed";
+            case RETENTION_EXPIRED -> "export snapshot version " + s.snapshotVersion()
+                    + " is no longer available (retention period elapsed; history compacted away)";
             default -> "export session is not active";
         };
         log.warn("export access rejected: exportId={} state={} reason={}",
@@ -551,6 +686,7 @@ public class ExportSessionManager implements AutoCloseable {
             case COMPLETED -> ExportSessionStore.EventType.COMPLETED;
             case CANCELLED -> ExportSessionStore.EventType.CANCELLED;
             case EXPIRED -> ExportSessionStore.EventType.EXPIRED;
+            case RETENTION_EXPIRED -> ExportSessionStore.EventType.RETENTION_EXPIRED;
         };
     }
 
@@ -584,6 +720,7 @@ public class ExportSessionManager implements AutoCloseable {
                 case COMPLETED -> ExportState.COMPLETED;
                 case CANCELLED -> ExportState.CANCELLED;
                 case EXPIRED -> ExportState.EXPIRED;
+                case RETENTION_EXPIRED -> ExportState.RETENTION_EXPIRED;
             };
             // 重启后没有明文凭据（credential=null），只保留哈希做校验
             ExportSession s = new ExportSession(e.exportId(), null, e.credentialHash(),
@@ -594,9 +731,25 @@ public class ExportSessionManager implements AutoCloseable {
         eventCount.set(events.size());
         // 启动时立即把已到点的会话标记为过期
         int recovered = sessions.size();
+        int retentionExpired = 0;
+        // 先按已持久化的压缩下界落定“超出保留期”：判定只取决于持久化状态，
+        // 与重启前是否还来得及报错无关——重启前后是同一种固定失败。
+        long floor = viewProvider.retentionFloor();
+        if (floor > 0L) {
+            for (ExportSession s : new ArrayList<>(sessions.values())) {
+                if (s.state() == ExportState.ACTIVE && s.snapshotVersion() < floor) {
+                    markRetentionExpired(s, "recovery: version precedes retention floor " + floor);
+                    retentionExpired++;
+                }
+            }
+        }
         sweepOnce(now);
         log.info("ExportSessionManager recovered: {} session(s) from log ({} events)",
                 recovered, events.size());
+        if (retentionExpired > 0) {
+            log.info("ExportSessionManager recovery: {} session(s) marked retention-expired "
+                    + "(floor={})", retentionExpired, floor);
+        }
     }
 
     @Override

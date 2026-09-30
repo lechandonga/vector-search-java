@@ -1,6 +1,7 @@
 package com.github.lechandonga.vectorsearchjava.service;
 
 import com.github.lechandonga.vectorsearchjava.config.VectorSearchProperties;
+import com.github.lechandonga.vectorsearchjava.error.ApiException;
 import com.github.lechandonga.vectorsearchjava.export.ExportPage;
 import com.github.lechandonga.vectorsearchjava.export.ExportSessionInfo;
 import com.github.lechandonga.vectorsearchjava.export.ExportSessionManager;
@@ -13,11 +14,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -34,6 +38,197 @@ class ExportServiceTest {
         return new float[]{1, 0, 0, 0, 0, 0, 0, 0};
     }
 
+    /**
+     * 压测场景（复现并回归“发起成功但第一页 410”的竞态）：
+     * 多个导出线程不断发起导出（发起成功后立刻拉第一页，再拉完整批次），
+     * 同时后台持续写入、删除与循环重建；压缩阈值调到最小，每次重建必触发压缩。
+     * 多轮循环，每轮断言：
+     * <ul>
+     *     <li>发起成功后立刻拉第一页必须成功，且内容与绑定视图完全一致；</li>
+     *     <li>整批逐页拼起来不重不漏、id 升序稳定，同一页重复拉取结果一致；</li>
+     *     <li>压测结束后重启进程，所有仍是 ACTIVE 的凭据继续拉页与重启前一致；</li>
+     *     <li>失败原因固定可区分（保留期/结束/取消/过期），不出现半截页或错数据。</li>
+     * </ul>
+     */
+    @Test
+    void concurrentStartFetchWithWritesDeletesAndAggressiveCompactionAcrossRoundsAndRestart(
+            @TempDir Path dir) throws Exception {
+        VectorSearchProperties p = props(dir);
+        p.setCompactThreshold(1);       // 最小阈值：每次重建都压缩
+        p.setExportMaxSessions(16);
+
+        int rounds = 3;
+        // 每轮存活下来（未主动结束）的导出凭据，重启后必须仍能续跑
+        List<ExportSessionManager.StartResult> survivors =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+
+        try (VectorSearchService svc = new VectorSearchService(p)) {
+            int seed = 60;
+            for (int i = 0; i < seed; i++) {
+                svc.putRaw("seed" + i, unit(), java.util.Map.of());
+            }
+
+            for (int round = 0; round < rounds; round++) {
+                int writerThreads = 2;
+                int exporterThreads = 3;
+                int rebuildThreads = 1;
+                int taskCount = writerThreads + exporterThreads + rebuildThreads;
+                CountDownLatch ready = new CountDownLatch(taskCount);
+                CountDownLatch go = new CountDownLatch(1);
+                ExecutorService pool = Executors.newFixedThreadPool(taskCount);
+                List<Future<?>> futures = new ArrayList<>();
+                AtomicInteger writes = new AtomicInteger();
+                AtomicInteger rebuilds = new AtomicInteger();
+                AtomicInteger exportsStarted = new AtomicInteger();
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                final int roundBase = round * 100_000;
+
+                for (int w = 0; w < writerThreads; w++) {
+                    final int wid = w;
+                    futures.add(pool.submit(() -> {
+                        ready.countDown();
+                        try {
+                            go.await();
+                            for (int i = 0; i < 40; i++) {
+                                int n = roundBase + wid * 1000 + i;
+                                svc.putRaw("w" + n, unit(), java.util.Map.of());
+                                writes.incrementAndGet();
+                                if (i % 5 == 0) {
+                                    // 删除既有 seed（发起前后的删除都不得污染已绑定视图）
+                                    svc.delete("seed" + (n % seed));
+                                }
+                            }
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                        return null;
+                    }));
+                }
+                futures.add(pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                        for (int i = 0; i < 12; i++) {
+                            svc.rebuild();
+                            rebuilds.incrementAndGet();
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                    return null;
+                }));
+                for (int e = 0; e < exporterThreads; e++) {
+                    futures.add(pool.submit(() -> {
+                        ready.countDown();
+                        try {
+                            go.await();
+                            for (int i = 0; i < 10; i++) {
+                                ExportSessionManager.StartResult started;
+                                try {
+                                    started = svc.startExport(SearchFilter.NONE, 13);
+                                } catch (ApiException ex) {
+                                    // 仅允许“会话名额到顶”这种可区分拒绝；其余都是缺陷
+                                    assertEquals(com.github.lechandonga.vectorsearchjava
+                                            .error.ErrorCode.EXPORT_LIMIT_REACHED, ex.code());
+                                    continue;
+                                }
+                                exportsStarted.incrementAndGet();
+                                String id = started.info().id();
+                                String cred = started.credential();
+
+                                // 核心回归断言：凭据刚返回，第一页立刻可读
+                                ExportPage first = svc.fetchExportPage(id, cred, 1);
+                                List<String> firstIds =
+                                        first.records().stream().map(r -> r.id()).toList();
+                                assertEquals(started.info().snapshotVersion(),
+                                        first.snapshotVersion());
+
+                                // 拉完整批次：不重不漏、id 升序、同页重复一致
+                                List<String> all = new ArrayList<>(firstIds);
+                                Set<String> uniq = new HashSet<>(firstIds);
+                                for (int page = 2; ; page++) {
+                                    ExportPage a = svc.fetchExportPage(id, cred, page);
+                                    ExportPage b = svc.fetchExportPage(id, cred, page);
+                                    List<String> ia =
+                                            a.records().stream().map(r -> r.id()).toList();
+                                    List<String> ib =
+                                            b.records().stream().map(r -> r.id()).toList();
+                                    assertEquals(ia, ib, "same page must be identical");
+                                    assertEquals(started.info().snapshotVersion(),
+                                            a.snapshotVersion());
+                                    for (String x : ia) {
+                                        if (!uniq.add(x)) {
+                                            throw new AssertionError("duplicate id: " + x);
+                                        }
+                                        all.add(x);
+                                    }
+                                    if (a.finished()) {
+                                        break;
+                                    }
+                                    if (page > 20_000) {
+                                        throw new AssertionError("runaway paging");
+                                    }
+                                }
+                                List<String> sorted = new ArrayList<>(all);
+                                Collections.sort(sorted);
+                                assertEquals(sorted, all, "pages must be in stable id order");
+                                assertEquals(started.info().totalRecords(), all.size(),
+                                        "drained batch must equal pinned view exactly");
+
+                                // 主动结束大部分会话；少部分保持 ACTIVE 跨重启续跑
+                                if (ThreadLocalRandom.current().nextInt(10) != 0) {
+                                    svc.completeExport(id, cred);
+                                } else {
+                                    survivors.add(started);
+                                }
+                            }
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                        return null;
+                    }));
+                }
+
+                assertTrue(ready.await(15, java.util.concurrent.TimeUnit.SECONDS));
+                go.countDown();
+                for (Future<?> f : futures) {
+                    f.get(120, java.util.concurrent.TimeUnit.SECONDS);
+                }
+                pool.shutdown();
+                if (failure.get() != null) {
+                    throw new AssertionError("round " + round + " failed: "
+                            + failure.get(), failure.get());
+                }
+                assertTrue(exportsStarted.get() > 0);
+                assertTrue(writes.get() > 0);
+                assertTrue(rebuilds.get() > 0);
+            }
+
+            // 重启前给每个幸存会话留下“第 1 页基准”，重启后必须逐字一致
+            Map<String, List<String>> before = new java.util.HashMap<>();
+            for (ExportSessionManager.StartResult s : survivors) {
+                List<String> ids = svc.fetchExportPage(s.info().id(), s.credential(), 1)
+                        .records().stream().map(r -> r.id()).toList();
+                before.put(s.info().id(), ids);
+            }
+            svc.close();
+
+            // 重启：未结束的凭据继续完整续跑，页内容与重启前完全一致
+            try (VectorSearchService svc2 = new VectorSearchService(p)) {
+                for (ExportSessionManager.StartResult s : survivors) {
+                    List<String> ids1 = svc2.fetchExportPage(s.info().id(), s.credential(), 1)
+                            .records().stream().map(r -> r.id()).toList();
+                    assertEquals(before.get(s.info().id()), ids1,
+                            "page 1 must be identical after restart");
+                    List<String> drained = drain(s.info().id(), s.credential(), svc2, 13);
+                    List<String> sorted = new ArrayList<>(drained);
+                    Collections.sort(sorted);
+                    assertEquals(sorted, drained);
+                    assertEquals(s.info().totalRecords(), drained.size());
+                }
+            }
+        }
+    }
     private static VectorSearchProperties props(Path dir) {
         VectorSearchProperties p = new VectorSearchProperties();
         p.setDimension(8);

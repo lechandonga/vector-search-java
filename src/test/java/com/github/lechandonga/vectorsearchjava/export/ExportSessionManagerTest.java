@@ -31,11 +31,19 @@ class ExportSessionManagerTest {
     private static final class FakeProvider implements ExportSessionManager.ViewProvider {
         private final Map<Long, List<VectorRecord>> versions = new HashMap<>();
         private volatile long current = 0;
+        private volatile long floor = 0L;
+        /** 若设置：压缩动作执行到一半时回调（用于制造“压缩撞上发起”的竞态窗口）。 */
+        private Runnable duringCompaction = null;
 
         synchronized long publish(List<VectorRecord> records) {
             current++;
             versions.put(current, List.copyOf(records));
             return current;
+        }
+
+        synchronized void dropHistoryBefore(long newFloor) {
+            floor = newFloor;
+            versions.keySet().removeIf(v -> v < newFloor);
         }
 
         @Override
@@ -50,6 +58,22 @@ class ExportSessionManagerTest {
         @Override
         public long currentVersion() {
             return current;
+        }
+
+        @Override
+        public long retentionFloor() {
+            return floor;
+        }
+
+        long simulateCoordinatedCompaction(ExportSessionManager mgr) throws java.io.IOException {
+            return mgr.runCoordinatedCompaction((ExportSessionManager.CompactionAction) preserve -> {
+                long base = preserve <= 0 ? current : preserve;
+                if (duringCompaction != null) {
+                    duringCompaction.run();
+                }
+                dropHistoryBefore(base);
+                return base;
+            });
         }
     }
 
@@ -331,6 +355,78 @@ class ExportSessionManagerTest {
             assertEquals(ErrorCode.EXPORT_EXPIRED,
                     assertThrows(ApiException.class,
                             () -> mgr2.fetch(expId, cred, 1)).code());
+        }
+    }
+
+    @Test
+    void retentionExpiryIsPersistentAndIdenticalAcrossRestart(@TempDir Path dir) throws Exception {
+        FakeProvider provider = new FakeProvider();
+        List<VectorRecord> v1 = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            v1.add(rec("a" + i, Map.of(), i + 1));
+        }
+        provider.publish(v1);
+        VectorSearchProperties p = props(dir);
+        p.setExportIdleTimeoutMillis(100_000);
+        p.setExportTtlMillis(1_000_000);
+        Path logFile = dir.resolve("s.log");
+        String expId;
+        String cred;
+        long pin;
+        try (ExportSessionStore st = new ExportSessionStore(logFile);
+             ExportSessionManager mgr = new ExportSessionManager(st, provider, p)) {
+            var s = mgr.start(SearchFilter.NONE, 2);
+            expId = s.info().id();
+            cred = s.credential();
+            pin = s.info().snapshotVersion();
+            assertEquals(List.of("a0", "a1"), pageIds(mgr.fetch(expId, cred, 1)));
+        }
+        // 会话存活期间维护性压缩不可能折叠 pin（协调锁保证）；
+        // 这里模拟保留期真正到期后的外部维护：历史下界前移到 pin 之后。
+        provider.dropHistoryBefore(pin + 1);
+
+        // 第一次失败：可区分的 EXPORT_SNAPSHOT_UNAVAILABLE，并落为持久化终态
+        try (ExportSessionStore st = new ExportSessionStore(logFile);
+             ExportSessionManager mgr = new ExportSessionManager(st, provider, p)) {
+            ApiException first = assertThrows(ApiException.class,
+                    () -> mgr.fetch(expId, cred, 1));
+            assertEquals(ErrorCode.EXPORT_SNAPSHOT_UNAVAILABLE, first.code());
+            assertEquals(ExportState.RETENTION_EXPIRED, mgr.status(expId, cred).state());
+        }
+        // 重启后：同凭据、同页得到完全相同的固定失败，重复请求也一致
+        try (ExportSessionStore st = new ExportSessionStore(logFile);
+             ExportSessionManager mgr2 = new ExportSessionManager(st, provider, p)) {
+            assertEquals(ExportState.RETENTION_EXPIRED, mgr2.status(expId, cred).state());
+            assertEquals(ErrorCode.EXPORT_SNAPSHOT_UNAVAILABLE,
+                    assertThrows(ApiException.class,
+                            () -> mgr2.fetch(expId, cred, 1)).code());
+            assertEquals(ErrorCode.EXPORT_SNAPSHOT_UNAVAILABLE,
+                    assertThrows(ApiException.class,
+                            () -> mgr2.fetch(expId, cred, 2)).code());
+        }
+    }
+
+    @Test
+    void activePinVersionIsNeverFoldedByCoordinatedCompaction(@TempDir Path dir)
+            throws Exception {
+        FakeProvider provider = new FakeProvider();
+        provider.publish(List.of(rec("a", Map.of(), 1), rec("b", Map.of(), 2)));
+        try (ExportSessionManager mgr = new ExportSessionManager(
+                new ExportSessionStore(dir.resolve("s.log")), provider, props(dir))) {
+            var s = mgr.start(SearchFilter.NONE, 10);
+            // pin 之后版本继续前进；压缩必须以活跃 pin 为下界
+            provider.publish(List.of(rec("a", Map.of(), 1), rec("b", Map.of(), 2),
+                    rec("c", Map.of(), 3)));
+            long floor = provider.simulateCoordinatedCompaction(mgr);
+            assertEquals(s.info().snapshotVersion(), floor,
+                    "compaction must preserve from the oldest active pin");
+            assertEquals(List.of("a", "b"), pageIds(mgr.fetch(s.info().id(),
+                    s.credential(), 1)));
+
+            // 会话结束后下一次压缩即可全量折叠到当前
+            mgr.complete(s.info().id(), s.credential());
+            long folded = provider.simulateCoordinatedCompaction(mgr);
+            assertEquals(provider.currentVersion(), folded);
         }
     }
 }

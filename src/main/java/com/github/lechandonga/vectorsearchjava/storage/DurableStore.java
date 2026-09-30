@@ -431,8 +431,8 @@ public class DurableStore implements AutoCloseable {
      * 完全压缩 WAL：把当前存活状态 + 全部墓碑重写为新日志（历史版本全部折叠）。
      * 仅当没有需要继续续跑的导出时安全。
      */
-    public void compact() throws IOException {
-        compact(0L);
+    public long compact() throws IOException {
+        return compact(0L);
     }
 
     /**
@@ -453,11 +453,18 @@ public class DurableStore implements AutoCloseable {
      *
      * @param preserveFromVersion 需要仍可物化的最老版本（最老活跃导出 pin 的版本）；
      *                            {@code <=0} 表示完全折叠到当前
+     * @return 压缩后新的历史下界（即新 WAL 中 BASE 的 seq）；之后对更早版本的物化
+     *         必然抛 {@link SnapshotUnavailableException}
      */
-    public void compact(long preserveFromVersion) throws IOException {
+    public long compact(long preserveFromVersion) throws IOException {
         mutationLock.lock();
         try {
             long base = preserveFromVersion <= 0 ? nextSeq - 1 : preserveFromVersion;
+            // 失重压缩快速跳过：下界不会前移，重写整个 WAL 只会白白阻塞写入。
+            // （最老活跃导出 pin 的版本不晚于当前历史下界时会走到这里。）
+            if (historyFloor != 0L && base <= historyFloor) {
+                return historyFloor;
+            }
             // 1) 重放出 base 版本视图（不更新内存状态）
             List<String> oldLines = wal.readRawLines();
             VersionScan baseScan = scanVersion(oldLines, base);
@@ -520,6 +527,7 @@ public class DurableStore implements AutoCloseable {
             log.info("WAL compacted: baseVersion={} baseObjects={} tailEntries={} tombstones={} "
                             + "newWalEntries={}",
                     base, baseView.size(), tail.size(), tombstones.size(), walEntries);
+            return base;
         } finally {
             mutationLock.unlock();
         }

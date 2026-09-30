@@ -196,13 +196,45 @@ curl -X POST localhost:8080/exports/exp_xxx/complete -H 'X-Export-Credential: <c
   - `EXPORT_EXPIRED`（410）：空闲超时或绝对寿命到期；
   - `EXPORT_CANCELLED`（410）：已被主动取消；
   - `EXPORT_FINISHED`（410）：已正常结束；
-  - `EXPORT_SNAPSHOT_UNAVAILABLE`（410）：绑定视图历史已超出保留期被压缩清除；
+  - `EXPORT_SNAPSHOT_UNAVAILABLE`（410）：绑定视图历史已超出保留期被压缩清除
+    （会话状态落为持久化终态 `RETENTION_EXPIRED`，见下）；
   - `EXPORT_NOT_FOUND`（404）：id 未知或凭据不匹配；
   - `EXPORT_LIMIT_REACHED`（429）：并发会话数或单会话占用到顶。
 - **导出不阻塞写入，也不被并发变更污染**：导出读历史 WAL 走独立路径，不持变更锁；
   并发的写入/删除/批量/重建照常进行。WAL 压缩与重建会**以最老的活跃导出 pin 为下界**
   保留历史（见 6 节），保证活跃导出始终能精确重建自己的视图；未 COMMIT 的批次
   （含压缩尾部逐字保留的“撕裂事务”）在任何历史版本物化时都不可见。
+
+#### 并发重建/压缩与导出发起同时发生时的保证
+
+导出发起（抓取版本号 → 物化该版本视图 → 会话注册可被压缩发现）与重建触发的
+WAL 压缩（读取最老活跃 pin → 折叠历史 → 切换 WAL 文件）由一把**协调锁**串行化为
+互为原子的两段，因此：
+
+- **只要发起成功返回了凭据**，该凭据绑定的 `snapshotVersion` 在整个会话存活期内
+  就始终可以按页物化。期间无论发生多少次写入、删除、重建（包括把压缩阈值调到最小、
+  每次重建都压缩），该版本历史都**绝不会被折叠掉**——不可能出现“凭据刚拿到、
+  第一页就 410”。
+- 压缩只有在确认当前没有任何活跃会话 pin 住更早版本时才会折叠对应历史；
+  折叠动作在协调锁内完成，与“取版本→注册”不存在竞争窗口。
+- 导出读历史 WAL 每次打开**独立的只读通道**，不与写入的 append/fsync 共用锁；
+  WAL 压缩扫描与导出物化都不会串行化并发写入，压测下写入/重建耗时不因导出变差。
+- 压缩后只清理不再被任何会话引用的物化视图缓存；活跃会话的 pin 视图缓存保留，
+  避免压缩阈值极小时反复全量重放 WAL。
+
+#### “超出保留期”在重启前后如何保持一致
+
+保留期判定**只取决于已持久化的状态**（数据 WAL 中 `BASE` 记录声明的历史下界），
+不依赖内存缓存或并发时序：
+
+- 活跃会话的 pin 版本早于历史下界时，下一次访问（拉页/状态查询）或服务启动恢复时
+  会把会话一次性落为持久化终态 `RETENTION_EXPIRED`（写入 `export-sessions.log` 并
+  fsync），此后返回固定的 `EXPORT_SNAPSHOT_UNAVAILABLE`（410）。
+- 该终态与会话日志一起跨重启：**重启前是什么失败原因，重启后还是同一个原因**；
+  同一凭据重复请求同一页结果一致，永远不会在“还能拉”和“410”之间摆动，更不会
+  返回半截页或错误数据。
+- 正常运行中，只要会话仍 ACTIVE 且未超时，其 pin 版本按上面的协调锁保证**不会**
+  早于历史下界；`RETENTION_EXPIRED` 只会在保留期真正到期后的维护性压缩之后出现。
 
 ### 与原有“固定版本翻页”的兼容关系
 
@@ -242,19 +274,23 @@ curl -X POST localhost:8080/exports/exp_xxx/complete -H 'X-Export-Credential: <c
 
 ### 导出会话生命周期
 
-状态机：`ACTIVE → COMPLETED | CANCELLED | EXPIRED`（终态不可逆，结束/取消操作幂等）。
+状态机：`ACTIVE → COMPLETED | CANCELLED | EXPIRED | RETENTION_EXPIRED`
+（终态不可逆，结束/取消操作幂等；同一凭据对终态会话的重复请求得到固定一致的失败）。
 
 - **正常结束**：所有页拉完（最后一页 `finished=true`）后调用
   `POST /exports/{id}/complete`；结束后再拉页返回 `EXPORT_FINISHED`。
 - **主动取消**：`POST /exports/{id}/cancel`，立即释放该会话占用与固定的历史版本。
 - **超时失效**：空闲超时或绝对 TTL 到点，由后台扫描线程（或下一次访问时的惰性判定）
   标记为 `EXPIRED`。
+- **超出保留期**：pin 版本早于数据 WAL 的压缩下界（历史已被维护性压缩折叠）时
+  标记为 `RETENTION_EXPIRED`，拉页固定返回 `EXPORT_SNAPSHOT_UNAVAILABLE`（410）；
+  判定只依赖持久化下界，重启前后一致。
 - **容量策略**：固定为**拒绝策略（REJECT）**——活跃会话数到顶时新发起直接返回
   `EXPORT_LIMIT_REACHED`，不会驱逐或静默截断已存在的导出；单会话视图超过
   `export-max-session-records` 同样在发起时拒绝。
 - **可观测**：每一次发起、拉页、结束、取消、过期与拒绝都有结构化日志，带
   `exportId`、绑定版本、页数与 `reason=`（如 `MAX_SESSIONS`、`SESSION_VIEW_TOO_LARGE`、
-  `IDLE_TIMEOUT`、`TTL_EXPIRED`、`CREDENTIAL_NOT_FOUND`、`SNAPSHOT_UNAVAILABLE`）。
+  `IDLE_TIMEOUT`、`TTL_EXPIRED`、`RETENTION_EXPIRED`、`CREDENTIAL_NOT_FOUND`）。
 
 降级时响应可与正常结果区分（`degraded=true` + 原因），并在日志中以
 `reason=QUERY_CANDIDATE_LIMIT` 记录快照版本、候选数与上限。拒绝写入/查询也都有
@@ -282,10 +318,17 @@ curl -X POST localhost:8080/exports/exp_xxx/complete -H 'X-Export-Credential: <c
   （逐字保留）→ 仍需保留的墓碑`。因此 pin 及之后的每个版本视图在压缩（及重启）后
   仍可精确重建；只有早于下界、且没有任何活跃导出使用的版本才会被折叠。
   没有任何活跃导出时才做完全折叠（等价于历史版本全部到期）。
+  “读出最老活跃 pin → 折叠 → 清理物化缓存”与导出发起的“取版本 → 物化 → 注册”
+  在同一协调锁内互为原子（见 4.1），因此发起成功返回的凭据所绑定的版本绝不会被
+  随后的压缩折叠；压缩完成后在同一临界区内发布新的当前索引版本，保证任何发起
+  读到的版本号都不早于新的 WAL 下界（不存在“版本已发布、折叠尚未完成”的窗口）；
+  下界不前移时压缩直接跳过，不做无谓的 WAL 重写。
 - **历史版本物化**：导出续跑时通过重放 WAL（`seq<=目标版本` 的已确认记录，
   以事务 `COMMIT` 的 seq 作为整批可见点）在内存重建该版本视图，不依赖进程内版本链；
   未 COMMIT 的事务（含崩溃留下的撕裂尾、压缩尾部逐字保留的未完成批次）在任何版本都
   不可见。目标版本早于压缩下界（`BASE`）会得到可区分的 `EXPORT_SNAPSHOT_UNAVAILABLE`。
+  该结论只由持久化下界决定：服务重启后重放 `BASE` 记录恢复下界，对同一 pin 的判定
+  与重启前完全相同。
 
 数据目录布局：`${data-dir}/vector-search.wal`（数据）与
 `${data-dir}/export-sessions.log`（导出会话事件，独立 fsync）。
@@ -319,6 +362,13 @@ mvn test
   - 生命周期：正常结束 / 主动取消 / 空闲超时与绝对 TTL 失效，失败原因彼此可区分
   - **并发**：导出与并发写入/删除/重建同时进行，不重不漏、不出现半成品批次、
     绑定版本始终不变；重建保留式压缩后导出仍可续，完全压缩后旧 pin 得到可区分失败
+  - **并发发起 × 压缩竞态**：多线程同时发起导出（发起成功后立刻拉第一页、再拉完整
+    批次）、写入、删除与循环重建，压缩阈值调到最小，多轮断言每个凭据的绑定视图
+    全程可读、逐页不重不漏、同页重复一致；再重启进程，存活凭据继续拉页与重启前一致
+  - **保留期终态**：pin 版本早于压缩下界时第一次失败即落为持久化
+    `RETENTION_EXPIRED`，重启后同凭据同页仍是同一个 `EXPORT_SNAPSHOT_UNAVAILABLE`
+  - **存储层并发物化**：并发写入 fsync、保留式压缩换文件与历史物化同时进行，
+    物化结果精确一致且不抛底层 IO 异常
   - **容量**：活跃会话数到顶拒绝（`MAX_SESSIONS`）、单会话视图超限拒绝
     （`SESSION_VIEW_TOO_LARGE`），拒绝均带 `exportId`/`reason` 可观测记录
   - 历史版本物化：任意历史版本可重建；未提交交错事务、压缩切过半开批次时不泄露半成品
@@ -352,6 +402,39 @@ curl -s -X POST localhost:8080/exports/<id>/complete -H 'X-Export-Credential: <c
 并发与重建保活可通过把 `vector-search.compact-threshold` 调到很小（如 1）后，
 在长导出期间反复 `POST /admin/rebuild` 与写入/删除来手工压测；活跃导出的页码与内容
 应保持不变。
+
+把压缩阈值调到最小的并发压测（复现/回归“发起成功但第一页 410”竞态）：
+
+```bash
+# 方式一：直接运行专门的并发回归测试（多轮 × 多线程 + 重启续跑断言）
+mvn test -Dtest=ExportServiceTest#concurrentStartFetchWithWritesDeletesAndAggressiveCompactionAcrossRoundsAndRestart
+
+# 方式二：起服务手工压（阈值=1，每次重建都触发 WAL 压缩）
+VECTOR_SEARCH_COMPACT_THRESHOLD=1 \
+VECTOR_SEARCH_EXPORT_IDLE_TIMEOUT_MS=3600000 \
+VECTOR_SEARCH_EXPORT_TTL_MS=86400000 \
+java -jar target/vector-search-java-1.0-SNAPSHOT.jar
+
+# 另一个终端并行跑（可用 & + wait 组合多个循环）：
+seq 1 1000 | xargs -P4 -I{} curl -s -X POST localhost:8080/vectors/raw \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"w{}","vector":['"$(yes 0.1 | head -64 | paste -sd, -)"']}' >/dev/null &
+for i in $(seq 1 100); do curl -s -X POST localhost:8080/admin/rebuild >/dev/null; done &
+# 导出循环：每次发起成功后立刻拉第 1 页——任何一页出现 410 EXPORT_SNAPSHOT_UNAVAILABLE
+# 都属于回归（会话存活期内绑定视图必须始终可读）
+for i in $(seq 1 200); do
+  resp=$(curl -s -X POST localhost:8080/exports -H 'Content-Type: application/json' -d '{"pageSize":50}')
+  id=$(echo "$resp" | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
+  cred=$(echo "$resp" | sed -n 's/.*"credential":"\([^"]*\)".*/\1/p')
+  curl -sf localhost:8080/exports/$id/pages/1 -H "X-Export-Credential: $cred" >/dev/null \
+    || { echo "page1 410 regression on $id"; exit 1; }
+done
+wait
+```
+
+重启一致性手工验证：压测进行到一半时 `kill -9` 服务进程，重新启动后用尚未
+`complete`/`cancel` 的凭据再拉同一页——页面内容必须与重启前逐字一致；若某个导出
+确实已超出保留期，则重启前后都返回同一个 `EXPORT_SNAPSHOT_UNAVAILABLE`（410）。
 
 日志默认同时输出到控制台与 `./logs/vector-search.log`，日志行包含**线程名、
 快照版本（snapshotVersion）、拒绝原因（reason=...）与降级依据**，便于回放并发时序。
