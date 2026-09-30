@@ -153,6 +153,33 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
         return exportManager;
     }
 
+    /**
+     * 仅供测试做权威对账：按数据 WAL 重放指定版本视图（不依赖导出管理器的内存缓存）。
+     * 返回该版本存活记录，顺序不保证，调用方可自行按 id 排序。
+     */
+    public List<VectorRecord> materializeViewForVerification(long version) {
+        return store.materializeAtVersion(version);
+    }
+
+    /**
+     * 仅供测试：模拟保留期到期后的外部维护性完全压缩（不经导出 pin 协作），
+     * 用于验证导出对此给出稳定、跨重启一致的 {@code EXPORT_SNAPSHOT_UNAVAILABLE}。
+     */
+    public void forceFullCompactionForVerification() {
+        long floor;
+        mutationRwLock.writeLock().lock();
+        try {
+            store.compact(0L);
+            floor = store.snapshot().version();
+        } catch (IOException e) {
+            throw new ApiException(ErrorCode.PERSISTENCE_FAILURE, "forced compaction failed", e);
+        } finally {
+            mutationRwLock.writeLock().unlock();
+        }
+        // 外部维护压缩不按导出 pin 保留：告知管理器新下界，丢弃更早的缓存视图
+        exportManager.retentionAdvancedTo(floor);
+    }
+
     // ------------------------------------------------------------------ 写入
 
     /** 直接提供向量的写入。 */
@@ -464,55 +491,87 @@ public class VectorSearchService implements DisposableBean, AutoCloseable {
     public RebuildResult rebuild() {
         synchronized (rebuildLock) {
             long fromVersion = current.get().version();
-            DurableStore.StoreSnapshot snap;
-            mutationRwLock.writeLock().lock();
+            // 构建在锁外用不可变快照进行（不阻塞写入/查询）。但构建期间可能有新写入，
+            // 因此发布前在写锁内重新核对版本：若快照已落后，则改用最新快照重建，
+            // 直到“构建所用快照版本 == 发布时刻最新版本”，杜绝把构建期间的写入静默丢掉
+            // （那会导致版本水位回退、且让刚绑定该版本的导出视图与索引不一致）。
+            DurableStore.StoreSnapshot snap = takeSnapshotUnderLock();
+            int attempts = 0;
             try {
-                snap = store.snapshot();
-            } finally {
-                mutationRwLock.writeLock().unlock();
-            }
-            try {
-                VectorIndex rebuilt = buildIndex(snap);
-                for (VectorRecord r : snap.liveRecords()) {
-                    if (snap.tombstones().containsKey(r.id())) {
-                        throw new IllegalStateException("rebuild included tombstoned id: " + r.id());
-                    }
-                }
-                // 构建成功后原子发布；旧节点在此之前一直可查，不会出现空/半成品索引
-                mutationRwLock.writeLock().lock();
-                boolean compacted = false;
-                try {
-                    current.set(rebuilt);
-                    retain(rebuilt);
-                    long threshold = props.getCompactThreshold();
-                    if (threshold > 0 && store.walEntryCount() > threshold) {
-                        try {
-                            // 压缩必须保住所有仍活跃导出绑定的历史视图：
-                            // 以最老活跃 pin 为下界折叠，导出续跑不受压缩影响
-                            long preserve = exportManager.oldestActiveVersion();
-                            store.compact(preserve);
-                            exportManager.notifyCompaction(preserve < 0 ? snap.version() : preserve);
-                            compacted = true;
-                        } catch (IOException ioe) {
-                            // 压缩失败不影响索引正确性（WAL 只是变大），记录后继续
-                            log.warn("WAL compaction after rebuild failed, continuing: {}",
-                                    ioe.getMessage());
+                while (true) {
+                    attempts++;
+                    VectorIndex rebuilt = buildIndex(snap);
+                    for (VectorRecord r : snap.liveRecords()) {
+                        if (snap.tombstones().containsKey(r.id())) {
+                            throw new IllegalStateException(
+                                    "rebuild included tombstoned id: " + r.id());
                         }
                     }
-                } finally {
-                    mutationRwLock.writeLock().unlock();
+                    mutationRwLock.writeLock().lock();
+                    try {
+                        long latestVersion = store.snapshot().version();
+                        if (latestVersion != snap.version()) {
+                            // 构建期间有并发写入：放弃过期索引，基于最新快照再来一轮
+                            // （发布动作尚未发生，可查询状态完全不变）。
+                            snap = store.snapshot();
+                            continue;
+                        }
+                        // 快照与当前一致：原子发布；旧节点在此之前一直可查，无空/半成品索引
+                        current.set(rebuilt);
+                        retain(rebuilt);
+                        boolean compacted = maybeCompactAfterRebuild(snap.version());
+                        log.info("index rebuilt and published atomically. fromVersion={} "
+                                        + "toVersion={} objects={} compacted={} buildAttempts={}",
+                                fromVersion, snap.version(), snap.liveRecords().size(),
+                                compacted, attempts);
+                        return new RebuildResult(fromVersion, snap.version(),
+                                snap.liveRecords().size());
+                    } finally {
+                        mutationRwLock.writeLock().unlock();
+                    }
                 }
-                log.info("index rebuilt and published atomically. fromVersion={} toVersion={} "
-                        + "objects={} compacted={}",
-                        fromVersion, snap.version(), snap.liveRecords().size(), compacted);
-                return new RebuildResult(fromVersion, snap.version(), snap.liveRecords().size());
             } catch (RuntimeException ex) {
-                // 重建失败：current 未被替换，查询仍看到重建前版本
+                // 重建失败：current 从未被替换，查询仍看到重建前版本
                 log.error("rebuild failed, keeping previous index. fromVersion={} reason={}",
                         fromVersion, ex.getMessage(), ex);
                 throw new ApiException(ErrorCode.REBUILD_FAILED,
                         "index rebuild failed, rolled back to version " + fromVersion, ex);
             }
+        }
+    }
+
+    /** 在写锁下取一致快照（构建期间不持锁，避免长时间阻塞写入）。 */
+    private DurableStore.StoreSnapshot takeSnapshotUnderLock() {
+        mutationRwLock.writeLock().lock();
+        try {
+            return store.snapshot();
+        } finally {
+            mutationRwLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * 重建发布后按需压缩。调用方必须持有变更写锁。
+     *
+     * <p>压缩通过 {@link ExportSessionManager#runCompactionWithPins} 与导出发起互斥：
+     * 读取 pin 下界、执行压缩、清理视图缓存对发起方是原子的，因此绝不会出现
+     * “导出已抓到版本/拿到凭据，但该版本视图恰好被这次压缩折叠”的窗口。
+     */
+    private boolean maybeCompactAfterRebuild(long publishedVersion) {
+        long threshold = props.getCompactThreshold();
+        if (threshold <= 0 || store.walEntryCount() <= threshold) {
+            return false;
+        }
+        try {
+            exportManager.runCompactionWithPins(preserve -> {
+                store.compact(preserve);
+                return preserve < 0 ? publishedVersion : store.historyFloor();
+            });
+            return true;
+        } catch (RuntimeException re) {
+            // 压缩失败不影响索引正确性（WAL 只是变大），记录后继续
+            log.warn("WAL compaction after rebuild failed, continuing: {}", re.getMessage());
+            return false;
         }
     }
 

@@ -289,15 +289,15 @@ public class DurableStore implements AutoCloseable {
             throw new SnapshotUnavailableException("invalid snapshot version: " + version);
         }
         final List<String> lines;
+        // 与压缩替换互斥地取出 WAL 的一个一致快照。压缩是低频维护操作且读取很快，
+        // 短暂持锁不会显著拖慢写入；更关键的是导出读的是不可变行列表，拿到后在锁外解析。
+        mutationLock.lock();
         try {
-            // 不持 mutationLock：与并发追加/压缩通过 WalFile 自身的写锁串行文件级操作，
-            // 读到的任何状态都是某个一致的已 fsync 前缀（末尾可能是撕裂行，下面截断）。
             lines = wal.readRawLines();
-        } catch (java.nio.file.NoSuchFileException nfe) {
-            // 极端时序：恰好与压缩替换相撞；重试一次
-            return materializeAtVersion(version);
         } catch (IOException ioe) {
             throw new java.io.UncheckedIOException("failed to read WAL for snapshot " + version, ioe);
+        } finally {
+            mutationLock.unlock();
         }
 
         VersionScan scan = scanVersion(lines, version);

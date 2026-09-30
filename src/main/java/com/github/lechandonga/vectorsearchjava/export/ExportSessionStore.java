@@ -38,7 +38,9 @@ public class ExportSessionStore implements AutoCloseable {
         PAGE,
         COMPLETED,
         CANCELLED,
-        EXPIRED
+        EXPIRED,
+        /** 绑定的数据视图已超出保留期被压缩清除（对外固定为 EXPORT_SNAPSHOT_UNAVAILABLE）。 */
+        UNAVAILABLE
     }
 
     /** 一条会话事件（不可变）。 */
